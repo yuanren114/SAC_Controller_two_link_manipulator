@@ -1,0 +1,22 @@
+{
+  "action_limit": 5.0,
+  "batch_size": 64,
+  "center_offset_px": 180.0,
+  "checkpoint": "",
+  "command": "train",
+  "control_mode": "residual_pd",
+  "deterministic_eval": true,
+  "dt": 0.016666666666666666,
+  "eval_episodes": 2,
+  "eval_interval": 600,
+  "max_episode_steps": 200,
+  "omega": 0.5,
+  "radius_px": 60.0,
+  "replay_size": 100000,
+  "seed": 7,
+  "start_steps": 200,
+  "total_steps": 1200,
+  "update_after": 200,
+  "update_every": 1,
+  "variant": "improved"
+}

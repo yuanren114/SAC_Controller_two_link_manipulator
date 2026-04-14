@@ -141,6 +141,12 @@ class Actor(nn.Module):
         self.backbone = build_mlp(self.state_dim, hidden_dims[:-1], hidden_dims[-1])
         self.mean_head = nn.Linear(hidden_dims[-1], action_dim)
         self.log_std_head = nn.Linear(hidden_dims[-1], action_dim)
+        # Start residual-control policies close to zero action; exploration still
+        # comes from the stochastic log-std head during training.
+        nn.init.uniform_(self.mean_head.weight, -1e-3, 1e-3)
+        nn.init.zeros_(self.mean_head.bias)
+        nn.init.uniform_(self.log_std_head.weight, -1e-3, 1e-3)
+        nn.init.constant_(self.log_std_head.bias, -1.0)
         ####################################################################
         #                          END OF YOUR CODE                        #
         ####################################################################
