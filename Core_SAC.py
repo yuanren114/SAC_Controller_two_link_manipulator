@@ -661,6 +661,17 @@ def render(config):
     sys.exit()
 
 
+def train_render(config):
+    train_config = ExperimentConfig(**asdict(config))
+    train_config.command = "train_render"
+    trained_run = train(train_config)
+
+    render_config = ExperimentConfig(**asdict(config))
+    render_config.command = "render"
+    render_config.checkpoint = str(Path(trained_run) / "checkpoints" / "best.pt")
+    render(render_config)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="TwoLink SAC trajectory tracking")
     sub = parser.add_subparsers(dest="command", required=False)
@@ -679,7 +690,7 @@ def parse_args():
         p.add_argument("--action-limit", type=float, default=5.0)
         p.add_argument("--checkpoint", default="")
 
-    for name in ["train", "eval", "render", "compare"]:
+    for name in ["train", "train-render", "eval", "render", "compare"]:
         common(sub.add_parser(name))
     return parser.parse_args()
 
@@ -707,6 +718,8 @@ def main():
     config = config_from_args(parse_args())
     if config.command == "train":
         train(config)
+    elif config.command == "train-render":
+        train_render(config)
     elif config.command == "eval":
         eval_checkpoint(config)
     elif config.command == "compare":

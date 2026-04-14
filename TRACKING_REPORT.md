@@ -92,6 +92,12 @@ Render a checkpoint with pygame:
 python Core_SAC.py render --checkpoint logs/<run>/checkpoints/best.pt --variant improved --control-mode residual_pd
 ```
 
+Train and then automatically show the best checkpoint in pygame:
+
+```text
+python Core_SAC.py train-render --total-steps 20000 --eval-interval 5000 --eval-episodes 5 --variant improved --control-mode residual_pd
+```
+
 Run the legacy-vs-improved ablation:
 
 ```text
