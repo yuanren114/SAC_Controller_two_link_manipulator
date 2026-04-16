@@ -1,0 +1,4 @@
+action_saturation_rate_mean,action_saturation_rate_std,episode_reward_mean,episode_reward_std,episodes,final_tracking_error_m_mean,final_tracking_error_m_std,max_tracking_error_m_mean,max_tracking_error_m_std,mean_action_norm_mean,mean_action_norm_std,mean_tracking_error_m_mean,mean_tracking_error_m_std,rms_tracking_error_m_mean,rms_tracking_error_m_std,step_label,success_rate_mean,success_rate_std
+0.0,0.0,-937.6113492474245,1.1368683772161603e-13,3,0.18470739746093753,2.7755575615628914e-17,0.2812181091308594,0.0,0.00026435554472360913,0.0,0.15419097936503093,0.0,0.15995750410276965,0.0,step_0,0.0,0.0
+0.0,0.0,-937.6113492474244,0.0,5,0.1847073974609375,0.0,0.2812181091308594,0.0,0.00026435554472360913,0.0,0.15419097936503093,0.0,0.15995750410276965,0.0,step_3000,0.0,0.0
+0.0,0.0,-937.6113492474244,0.0,5,0.1847073974609375,0.0,0.2812181091308594,0.0,0.00026435554472360913,0.0,0.15419097936503093,0.0,0.15995750410276965,0.0,final,0.0,0.0
