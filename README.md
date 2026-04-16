@@ -1,160 +1,119 @@
 # Two-Link Arm SAC Trajectory Tracking
 
-This project trains and evaluates a Soft Actor-Critic controller for a two-link robotic arm tracking a circular end-effector trajectory.
+This project trains, evaluates, and visualizes a Soft Actor-Critic controller for a two-link planar robotic arm. The current controller uses direct joint torque actions, a meter-based tracking state, and selectable target trajectories.
 
-The current code keeps the original project structure small:
+Core files:
 
-- `Core_SAC.py`: arm dynamics, trajectory target generation, observations, rewards, training loop, evaluation loop, pygame rendering, logging, and CLI commands.
-- `sac_agent.py`: generic SAC implementation, including actor, critics, replay buffer, losses, entropy tuning, and checkpoint save/load.
+- `Core_SAC.py`: arm dynamics, trajectory generation, state construction, reward/metrics, training, evaluation, rendering, logging, and CLI commands.
+- `sac_agent.py`: SAC actor, critics, replay buffer, losses, entropy tuning, LSTM layers, and checkpoint save/load.
 - `logs/`: timestamped experiment outputs with configs, metrics, plots, trajectory CSV files, and checkpoints.
 
-## What Improved Compared To The Original Version
+## Usage Cheat Sheet
 
-The original version had the main pieces needed for SAC, but the control/training pipeline made trajectory tracking hard to debug and unstable.
+Default behavior:
 
-Important improvements:
+- Default trajectory mode is `circle`.
+- Available trajectory modes are `circle` and `pdf`.
+- SAC actions are direct joint torque commands bounded by the configured action limit.
+- Training/evaluation outputs are saved under `logs/...`.
+- Evaluation outputs and plots are saved inside the run directory.
 
-- Added reproducible CLI entry points for `train`, `eval`, `render`, `compare`, and `train-render`.
-- Separated fast training/evaluation from pygame rendering, so training is not forced to run at 60 Hz.
-- Added timestamped experiment folders under `logs/`.
-- Added `config.json` snapshots for each run.
-- Added training logs:
-  - `training_episodes.csv`
-  - `training_steps.jsonl`
-- Added evaluation logs:
-  - `evaluation.csv`
-  - per-episode trajectory CSV files
-  - `summary.json`
-- Added plots:
-  - target vs actual trajectory plots
-  - tracking error plots
-  - training curves
-  - evaluation tracking error curves
-- Added model checkpoints:
-  - `checkpoints/best.pt`
-  - `checkpoints/final.pt`
-  - intermediate step checkpoints
-- Added deterministic checkpoint evaluation.
-- Added a legacy-vs-improved comparison command.
-- Fixed the main controller mismatch: the old code said `SAC(delta_q) + PD`, but SAC output was actually applied directly as torque and the existing `pd_torque()` helper was unused.
-- Added `residual_pd` mode, where the existing PD controller provides stable baseline tracking and SAC learns a bounded residual torque.
-- Added normalized improved observations instead of mixing radians, rad/s, and raw pixels.
-- Added meter-scale tracking reward and explicit tracking metrics.
-- Initialized the SAC actor output near zero so the residual policy starts from the PD baseline instead of a random deterministic residual action.
-- Fixed `.gitignore` so generated `__pycache__/` files are ignored.
+Trajectory modes:
 
-Measured quick comparison from the included debug run:
+- `circle`: the original circular trajectory geometry, represented internally in meters for consistency with the current state pipeline.
+- `pdf`: the PDF-aligned sinusoidal target trajectory projected into the current 2D arm environment.
 
-| Controller | Mean error (m) | RMS error (m) | Max error (m) | Final error (m) | Success rate |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Legacy direct torque | 0.200077 | 0.217833 | 0.449405 | 0.160011 | 0.0125 |
-| Improved residual-PD | 0.050482 | 0.059722 | 0.115160 | 0.030465 | 0.1975 |
+Commands:
 
-This is about a `3.96x` mean tracking error improvement before long SAC training.
+```powershell
+python Core_SAC.py train
+```
 
-## Core_SAC.py Principles
+Runs training, periodic evaluation, checkpointing, CSV/JSON logging, and plot generation. It does not open real-time pygame visualization.
 
-`Core_SAC.py` defines the physical task and experiment workflow.
+```powershell
+python Core_SAC.py train --trajectory-mode circle
+```
 
-The arm is a two-link planar robot. Its state is:
+Runs training with the default original circular trajectory.
 
-- joint angle `q`
-- joint velocity `dq`
-- joint acceleration `qdd`
+```powershell
+python Core_SAC.py train --trajectory-mode pdf
+```
 
-The dynamics use the standard manipulator equation:
+Runs training with the PDF-style sinusoidal target trajectory.
+
+```powershell
+python Core_SAC.py render --checkpoint <path_to_checkpoint>
+```
+
+Opens pygame visualization. If a checkpoint is provided, the renderer loads that policy; without a checkpoint, it renders the current untrained policy.
+
+```powershell
+python Core_SAC.py train-render --trajectory-mode circle
+```
+
+Runs training first, then launches pygame visualization using the trained best checkpoint.
+
+Output locations:
+
+- Each run creates a folder under `logs/...`.
+- `config.json`, `summary.md`, `evaluation.csv`, trajectory CSV files, and plots are saved in the run directory.
+- Training runs also save `training_episodes.csv`, `training_steps.jsonl`, training curves, and checkpoints.
+- Checkpoints are saved under `logs/<run>/checkpoints/`, including `best.pt` and `final.pt`.
+
+## Current Control And State Behavior
+
+`Core_SAC.py` defines a two-link planar arm with dynamics of the form:
 
 ```text
 M(q) qdd + C(q, dq) + G(q) + damping = tau
 ```
 
-where:
-
-- `M(q)` is the mass/inertia matrix.
-- `C(q, dq)` is the Coriolis/centrifugal term.
-- `G(q)` is the gravity term.
-- `tau` is the applied joint torque.
-
-The target trajectory is a circle in screen coordinates. Each target end-effector point is converted to a desired joint target with inverse kinematics:
+The active control path is direct torque:
 
 ```text
-target end-effector point -> q_des
-next target point -> q_des_next
-dq_des = (q_des_next - q_des) / dt
+tau = clip(actor_action, -action_limit, action_limit)
 ```
 
-The improved controller uses:
+The actor output is not a target position, not a delta action, and not a residual added to a PD controller.
+
+The state follows the current meter-based tracking structure:
 
 ```text
-tau_total = clip(tau_PD + tau_SAC_residual, -20, 20)
+[q, dq, x, dx, x_d, dx_d, e, de]
 ```
 
 where:
 
-- `tau_PD` comes from the existing PD controller.
-- `tau_SAC_residual` is learned by SAC.
-- The residual is bounded by `--action-limit`.
+- `q`, `dq` are joint angle and joint velocity.
+- `x`, `dx` are end-effector position and velocity in meters.
+- `x_d`, `dx_d` are target position and target velocity in meters.
+- `e`, `de` are position and velocity tracking errors.
 
-This makes learning easier because the agent does not need to discover basic stabilizing control from scratch. SAC only needs to improve or compensate around a working PD baseline.
+## Trajectories
 
-The improved observation includes normalized tracking-relevant information:
+### `circle`
 
-- `sin(q)`, `cos(q)` for angle representation
-- normalized `dq`
-- `sin(q_des)`, `cos(q_des)`
-- normalized `dq_des`
-- normalized joint tracking error
-- normalized end-effector tracking error
-
-The improved reward uses meter-scale quantities:
-
-- end-effector tracking error penalty
-- progress reward when error decreases
-- joint tracking error penalty
-- action effort penalty
-- residual torque penalty
-- small success bonus when tracking error is below threshold
-
-## sac_agent.py Principles
-
-`sac_agent.py` implements Soft Actor-Critic, an off-policy reinforcement learning algorithm for continuous actions.
-
-SAC has three main parts:
-
-- Actor: chooses actions.
-- Critic 1 and Critic 2: estimate action value.
-- Replay buffer: stores past transitions for off-policy learning.
-
-The actor outputs a Gaussian policy:
+The `circle` trajectory preserves the original geometry and motion:
 
 ```text
-state -> mean, log_std -> sample action -> tanh -> normalized action [-1, 1]
+x_px = arm.base[0] + radius_px * cos(omega * t)
+y_px = arm.base[1] - center_offset_px + radius_px * sin(omega * t)
 ```
 
-The normalized action is scaled to the environment action range. In `residual_pd` mode, this means the action is residual torque.
+Internally, this is converted to meters with `arm.scale`, so the state and reward remain self-consistent.
 
-SAC uses two critics to reduce Q-value overestimation:
+### `pdf`
+
+The `pdf` trajectory uses the PDF-style sinusoidal target projected into the current 2D environment:
 
 ```text
-Q_target = min(Q1_target, Q2_target) - alpha * log_prob(action)
+x_d = 0.1 sin(t) + 0.12
+y_d = 0.1 cos(t) + 0.12
 ```
 
-The critic loss trains Q-functions to match the Bellman target:
-
-```text
-target = reward + gamma * (1 - done) * Q_target
-critic_loss = MSE(Q, target)
-```
-
-The actor loss encourages actions with high Q-value while keeping entropy:
-
-```text
-actor_loss = mean(alpha * log_prob(action) - Q(action))
-```
-
-The entropy coefficient `alpha` is automatically tuned so the policy keeps enough exploration during training.
-
-In this project, the actor output head is initialized near zero. That matters because the improved controller is residual control: zero SAC action means the controller behaves like the PD baseline.
+Both trajectory modes provide target position `x_d` and target velocity `dx_d` in meters to the same state and reward pipeline.
 
 ## Logs And Output Structure
 
@@ -168,12 +127,12 @@ Typical files:
 
 ```text
 config.json
+summary.md
 training_episodes.csv
 training_steps.jsonl
-evaluation.csv
 training_curves.png
+evaluation.csv
 evaluation_tracking_error.png
-summary.md
 checkpoints/best.pt
 checkpoints/final.pt
 eval/<step_label>/episode_000_trajectory.csv
@@ -181,61 +140,21 @@ eval/<step_label>/episode_000_trajectory.png
 eval/<step_label>/summary.json
 ```
 
-## Command Cheatsheet
+## Other Useful Commands
 
-### Train Only
-
-```powershell
-python Core_SAC.py train --total-steps 20000 --eval-interval 5000 --eval-episodes 5 --variant improved --control-mode residual_pd
-```
-
-### Train And Then Automatically Render Best Checkpoint
+Evaluate a checkpoint:
 
 ```powershell
-python Core_SAC.py train-render --total-steps 20000 --eval-interval 5000 --eval-episodes 5 --variant improved --control-mode residual_pd
+python Core_SAC.py eval --checkpoint <path_to_checkpoint> --trajectory-mode circle
 ```
 
-Quick smoke-test version:
+Run the comparison command:
 
 ```powershell
-python Core_SAC.py train-render --total-steps 1200 --eval-interval 600 --eval-episodes 2 --max-episode-steps 200 --start-steps 200 --update-after 200 --batch-size 64
+python Core_SAC.py compare --eval-episodes 5
 ```
 
-### Render From One Existing Training Log
-
-Use the `best.pt` or `final.pt` checkpoint inside that log folder.
-
-Best checkpoint:
-
-```powershell
-python Core_SAC.py render --checkpoint logs\<run-folder>\checkpoints\best.pt --variant improved --control-mode residual_pd
-```
-
-Final checkpoint:
-
-```powershell
-python Core_SAC.py render --checkpoint logs\<run-folder>\checkpoints\final.pt --variant improved --control-mode residual_pd
-```
-
-Example:
-
-```powershell
-python Core_SAC.py render --checkpoint logs\20260414_115941_train_improved_residual_pd_seed7\checkpoints\best.pt --variant improved --control-mode residual_pd
-```
-
-### Evaluate One Existing Training Log
-
-```powershell
-python Core_SAC.py eval --checkpoint logs\<run-folder>\checkpoints\best.pt --variant improved --control-mode residual_pd --eval-episodes 5
-```
-
-### Compare Legacy And Improved Controllers
-
-```powershell
-python Core_SAC.py compare --eval-episodes 5 --max-episode-steps 600
-```
-
-### Show CLI Help
+Show CLI help:
 
 ```powershell
 python Core_SAC.py train --help
@@ -245,38 +164,10 @@ python Core_SAC.py render --help
 python Core_SAC.py compare --help
 ```
 
-## Recommended Workflow
-
-1. Run a quick smoke test:
-
-```powershell
-python Core_SAC.py train-render --total-steps 1200 --eval-interval 600 --eval-episodes 2 --max-episode-steps 200 --start-steps 200 --update-after 200 --batch-size 64
-```
-
-2. Run a longer training job:
-
-```powershell
-python Core_SAC.py train --total-steps 50000 --eval-interval 5000 --eval-episodes 5 --variant improved --control-mode residual_pd
-```
-
-3. Render the best checkpoint:
-
-```powershell
-python Core_SAC.py render --checkpoint logs\<run-folder>\checkpoints\best.pt --variant improved --control-mode residual_pd
-```
-
-4. Inspect:
-
-- `evaluation.csv`
-- `training_episodes.csv`
-- `training_curves.png`
-- `evaluation_tracking_error.png`
-- `eval/<step_label>/*trajectory.png`
-
 ## Notes
 
-- `render` is for visualization.
-- `train` is for fast learning and logging.
-- `train-render` is the one-command convenience path: train first, then show the best result.
+- Use `train` for learning and logging without real-time visualization.
+- Use `render` for pygame visualization.
+- Use `train-render` when you want one command that trains first and then visualizes the trained checkpoint.
 - Use `best.pt` when you want the checkpoint with the lowest evaluation tracking error.
-- Use `final.pt` when you specifically want the last policy from the training run.
+- Use `final.pt` when you specifically want the last policy from a training run.
