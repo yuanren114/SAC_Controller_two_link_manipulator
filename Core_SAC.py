@@ -60,7 +60,7 @@ class TwoLink:
         return M, C, G
 
     def step(self, tau, dt):
-        tau = np.clip(np.asarray(tau, dtype=np.float64), -20.0, 20.0)
+        tau = np.clip(np.asarray(tau, dtype=np.float64), -5.0, 5.0)
         M, C, G = self.dynamics_terms(self.q, self.dq)
         qdd = np.linalg.solve(M, tau - C - G - 0.5 * self.dq)
         if not np.all(np.isfinite(qdd)):
@@ -69,7 +69,7 @@ class TwoLink:
         self.dq = np.clip(self.dq + self.qdd * dt, -10.0, 10.0)
         if not np.all(np.isfinite(self.dq)):
             self.dq = np.zeros_like(self.dq)
-        self.q = np.clip(self.q + self.dq * dt, -3.0 * np.pi, 3.0 * np.pi)
+        self.q = np.clip(self.q + self.dq * dt, -np.pi, np.pi)
         if not np.all(np.isfinite(self.q)):
             self.q = np.zeros_like(self.q)
 
@@ -112,18 +112,19 @@ class TwoLink:
 class ExperimentConfig:
     command: str = "train"
     variant: str = "improved"
-    control_mode: str = "residual_pd"
+    control_mode: str = "direct_torque"
+    trajectory_mode: str = "circle"
     seed: int = 7
-    total_steps: int = 20000
+    total_steps: int = 3000
     eval_interval: int = 5000
     eval_episodes: int = 5
-    max_episode_steps: int = 600
-    batch_size: int = 128
-    replay_size: int = 100000
-    start_steps: int = 1000
-    update_after: int = 1000
+    max_episode_steps: int = 3000
+    batch_size: int = 256
+    replay_size: int = 1000000
+    start_steps: int = 5000
+    update_after: int = 5000
     update_every: int = 1
-    dt: float = 1.0 / 60.0
+    dt: float = 0.01
     radius_px: float = 60.0
     center_offset_px: float = 180.0
     omega: float = 0.5
@@ -155,15 +156,56 @@ def ik_for_point(arm, point_px):
     return arm.ik4traject((point_px[0] - arm.base[0]) / arm.scale, (point_px[1] - arm.base[1]) / arm.scale)
 
 
+def pdf_target_m(t):
+    return np.array([0.1 * np.sin(t) + 0.12, 0.1 * np.cos(t) + 0.12], dtype=np.float32)
+
+
+def pdf_target_velocity_m(t):
+    return np.array([0.1 * np.cos(t), -0.1 * np.sin(t)], dtype=np.float32)
+
+
+def circle_target_m(arm, t, config):
+    radius_m = config.radius_px / arm.scale
+    center_m = np.array([0.0, -config.center_offset_px / arm.scale], dtype=np.float32)
+    phase = config.omega * t
+    return center_m + radius_m * np.array([np.cos(phase), np.sin(phase)], dtype=np.float32)
+
+
+def circle_target_velocity_m(arm, t, config):
+    radius_m = config.radius_px / arm.scale
+    phase = config.omega * t
+    return radius_m * config.omega * np.array([-np.sin(phase), np.cos(phase)], dtype=np.float32)
+
+
+def target_at_m(arm, t, config):
+    if config.trajectory_mode == "circle":
+        return circle_target_m(arm, t, config), circle_target_velocity_m(arm, t, config)
+    if config.trajectory_mode == "pdf":
+        return pdf_target_m(t), pdf_target_velocity_m(t)
+    raise ValueError(f"Unknown trajectory_mode: {config.trajectory_mode}")
+
+
+def point_m_to_px(arm, point_m):
+    return (arm.base.astype(np.float32) + point_m.astype(np.float32) * arm.scale).astype(np.float32)
+
+
 def ref_at(arm, t, dt, config):
-    cx, cy, r, w = arm.base[0], arm.base[1] - config.center_offset_px, config.radius_px, config.omega
-    xd = np.array([cx + r * np.cos(w * t), cy + r * np.sin(w * t)], dtype=np.float32)
-    xd1 = np.array([cx + r * np.cos(w * (t + dt)), cy + r * np.sin(w * (t + dt))], dtype=np.float32)
-    xd2 = np.array([cx + r * np.cos(w * (t + 2 * dt)), cy + r * np.sin(w * (t + 2 * dt))], dtype=np.float32)
+    xd_m, dxd_m = target_at_m(arm, t, config)
+    xd1_m, dxd1_m = target_at_m(arm, t + dt, config)
+    xd2_m, _ = target_at_m(arm, t + 2 * dt, config)
+    xd = point_m_to_px(arm, xd_m)
+    xd1 = point_m_to_px(arm, xd1_m)
+    xd2 = point_m_to_px(arm, xd2_m)
     q, q1, q2 = ik_for_point(arm, xd), ik_for_point(arm, xd1), ik_for_point(arm, xd2)
     dq = np.clip((q1 - q) / dt, -10.0, 10.0).astype(np.float32)
     dq1 = np.clip((q2 - q1) / dt, -10.0, 10.0).astype(np.float32)
-    return {"xd": xd, "xd_next": xd1, "q_des": q, "q_des_next": q1, "dq_des": dq, "dq_des_next": dq1}
+    return {
+        "xd": xd, "xd_next": xd1,
+        "xd_m": xd_m, "xd_next_m": xd1_m,
+        "dxd_m": dxd_m, "dxd_next_m": dxd1_m,
+        "q_des": q, "q_des_next": q1,
+        "dq_des": dq, "dq_des_next": dq1,
+    }
 
 
 def ee_px(arm):
@@ -174,39 +216,47 @@ def local_m(arm, point_px):
     return ((point_px.astype(np.float32) - arm.base.astype(np.float32)) / arm.scale).astype(np.float32)
 
 
+def ee_velocity_m(arm):
+    q1, q2 = arm.q
+    dq1, dq2 = arm.dq
+    s1, c1 = math.sin(q1), math.cos(q1)
+    s12, c12 = math.sin(q1 + q2), math.cos(q1 + q2)
+    jac = np.array([
+        [-arm.l1 * s1 - arm.l2 * s12, -arm.l2 * s12],
+        [arm.l1 * c1 + arm.l2 * c12, arm.l2 * c12],
+    ], dtype=np.float64)
+    return (jac @ np.array([dq1, dq2], dtype=np.float64)).astype(np.float32)
+
+
 def state_dim(config):
-    return 12 if config.variant == "legacy" else 18
+    return 16
 
 
 def build_state(arm, ref, config, next_state=False):
     ee = ee_px(arm)
     xd = ref["xd_next"] if next_state else ref["xd"]
-    qd = ref["q_des_next"] if next_state else ref["q_des"]
-    dqd = ref["dq_des_next"] if next_state else ref["dq_des"]
-    if config.variant == "legacy":
-        return np.hstack([arm.q.astype(np.float32), arm.dq.astype(np.float32), qd, dqd, ee, xd]).astype(np.float32)
     q, dq = arm.q.astype(np.float32), arm.dq.astype(np.float32)
-    q_err, dq_err = qd - q, dqd - dq
-    ee_err = local_m(arm, xd) - local_m(arm, ee)
+    x = local_m(arm, ee)
+    dx = ee_velocity_m(arm)
+    xd_m = ref["xd_next_m"] if next_state else ref["xd_m"]
+    dxd_m = ref["dxd_next_m"] if next_state else ref["dxd_m"]
+    e = x - xd_m
+    de = dx - dxd_m
     return np.hstack([
-        np.sin(q), np.cos(q), dq / 10.0,
-        np.sin(qd), np.cos(qd), dqd / 10.0,
-        q_err / np.pi, dq_err / 10.0,
-        ee_err / (arm.l1 + arm.l2),
+        q, dq, x, dx, xd_m, dxd_m, e, de,
     ]).astype(np.float32)
 
 
 def reset_arm(arm, config, t=None):
     if t is None:
-        t = np.random.uniform(0.0, 2.0 * np.pi / config.omega)
-    ref = ref_at(arm, t, config.dt, config)
-    arm.q = ref["q_des"].astype(np.float64)
+        t = 0.0
+    arm.q = np.array([-0.3, 0.3], dtype=np.float64)
     arm.dq = np.zeros(2, dtype=np.float64)
     return t
 
 
 def make_agent(config):
-    limit = 20.0 if config.control_mode == "direct_torque" else config.action_limit
+    limit = config.action_limit
     return SAC(
         state_dim=state_dim(config),
         action_dim=2,
@@ -222,35 +272,22 @@ def control(arm, agent, state, ref, total_steps, config, deterministic=False):
     else:
         action_env, action_norm = agent.select_action(state, deterministic=deterministic)
         action_env, action_norm = action_env.astype(np.float32), action_norm.astype(np.float32)
-    if config.control_mode == "residual_pd":
-        tau_pd = arm.pd_torque(ref["q_des"], ref["dq_des"]).astype(np.float32)
-        tau_res = np.clip(action_env, -config.action_limit, config.action_limit).astype(np.float32)
-        tau = np.clip(tau_pd + tau_res, -20.0, 20.0).astype(np.float32)
-    else:
-        tau_pd = np.zeros(2, dtype=np.float32)
-        tau_res = action_env.astype(np.float32)
-        tau = np.clip(action_env, -20.0, 20.0).astype(np.float32)
+    tau_pd = np.zeros(2, dtype=np.float32)
+    tau_res = np.clip(action_env, -config.action_limit, config.action_limit).astype(np.float32)
+    tau = tau_res.copy()
     return tau, tau_res, tau_pd, action_norm
 
 
 def reward_metrics(arm, ref, prev_ee, action_norm, tau, tau_res, config):
     ee = ee_px(arm)
     q, dq = arm.q.astype(np.float32), arm.dq.astype(np.float32)
-    q_err = ref["q_des_next"].astype(np.float32) - q
-    dq_err = ref["dq_des_next"].astype(np.float32) - dq
     err_px = float(np.linalg.norm(ee - ref["xd_next"])) if np.all(np.isfinite(ee)) else 1e6
-    prev_err_px = float(np.linalg.norm(prev_ee - ref["xd"])) if np.all(np.isfinite(prev_ee)) else 1e6
     err_m = err_px / arm.scale
-    progress_m = (prev_err_px - err_px) / arm.scale
-    if config.variant == "legacy":
-        reward = -1.5 * err_px - 0.01 * float(np.sum(dq**2)) - 0.05 * float(np.sum(action_norm**2))
-        reward += 2.0 * (prev_err_px - err_px)
-    else:
-        reward = -40.0 * err_m + 20.0 * progress_m
-        reward += -2.0 * float(np.sum(q_err**2))
-        reward += -0.02 * float(np.sum(action_norm**2))
-        reward += -0.005 * float(np.sum((tau_res / max(config.action_limit, 1e-6)) ** 2))
-        reward += 1.0 if err_m < 0.015 else 0.0
+    reward = 1.0 - math.exp(2.0 * (err_m - 0.02))
+    dx = ee_velocity_m(arm)
+    dxd = ref["dxd_next_m"].astype(np.float32)
+    q_err = ref["q_des_next"].astype(np.float32) - q
+    dq_err = dxd - dx
     metrics = {
         "reward": float(reward),
         "ee_error_px": err_px,
@@ -302,7 +339,7 @@ def run_episode(agent, config, train=False, replay_buffer=None, update_state=Non
         next_ref = ref_at(arm, t, config.dt, config)
         next_state = build_state(arm, next_ref, config, next_state=True)
         reward, metrics = reward_metrics(arm, next_ref, prev_ee, action_norm, tau, tau_res, config)
-        bad = not np.all(np.isfinite(next_state)) or np.any(np.abs(arm.q) > 10.0) or np.any(np.abs(arm.dq) > 20.0)
+        bad = not np.all(np.isfinite(next_state)) or np.any(np.abs(arm.q) > np.pi) or np.any(np.abs(arm.dq) > 20.0)
         done = step + 1 >= config.max_episode_steps or bad
         if train:
             replay_buffer.push(state, action_norm, reward, next_state, float(done))
@@ -476,7 +513,7 @@ def write_summary(path, config, final_eval, best_error):
         f"- Final max tracking error: `{final_eval['max_tracking_error_m_mean']:.6f} m`",
         f"- Final success rate: `{final_eval['success_rate_mean']:.3f}`",
         f"- Best evaluation mean error: `{best_error:.6f} m`", "",
-        "The improved controller keeps the existing IK target and PD torque as the stabilizing baseline, while SAC learns bounded residual torque. This fixes the original mismatch where the code title described SAC plus PD but the loop applied SAC torque directly.",
+        "The active controller applies the SAC policy output directly as joint torque bounded by the PDF action range.",
     ]
     with (Path(path) / "summary.md").open("w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -544,7 +581,7 @@ def compare(config):
     path = run_dir(config)
     save_config(config, path)
     rows = []
-    for label, variant, mode in [("legacy_direct_torque", "legacy", "direct_torque"), ("improved_residual_pd", "improved", "residual_pd")]:
+    for label, variant, mode in [("pdf_direct_torque", "improved", "direct_torque")]:
         cfg = ExperimentConfig(**asdict(config))
         cfg.variant, cfg.control_mode = variant, mode
         agent = make_agent(cfg)
@@ -565,36 +602,20 @@ def compare(config):
 
 
 def write_report(path, rows):
-    before, after = rows[0], rows[1]
-    ratio = before["mean_tracking_error_m"] / max(after["mean_tracking_error_m"], 1e-9)
     lines = [
         "# SAC Tracking Debug Report", "",
         "## Current Pipeline", "",
-        "- `TwoLink` in `Core_SAC.py` owns dynamics, inverse kinematics, forward kinematics, PD torque, and pygame drawing.",
-        "- The previous control loop mixed target generation, SAC updates, reward calculation, checkpointing, and pygame rendering in one 60 Hz loop.",
-        "- Circle targets are defined by radius, center offset, and angular rate; IK converts target end-effector points to joint targets.",
+        "- `TwoLink` in `Core_SAC.py` owns dynamics, inverse kinematics, forward kinematics, and pygame drawing.",
+        "- Target generation follows the PDF's task-space sinusoid in the available 2D plane.",
         "- `sac_agent.py` contains the generic SAC actor, critics, replay buffer, updates, and checkpoint serialization.", "",
-        "## Likely Failure Points Found", "",
-        "- The code described `SAC(delta_q) + PD`, but SAC output was applied directly as torque and `pd_torque()` was unused.",
-        "- Training was coupled to pygame rendering and `clock.tick(60)`, slowing data collection.",
-        "- Observations mixed radians, rad/s, and raw pixel coordinates without normalization.",
-        "- The reward was dominated by pixel-scale tracking error and no metrics were persisted.",
-        "- There was no deterministic evaluation entry point, best checkpoint, config snapshot, or trajectory plot.", "",
-        "## Changes", "",
-        "- Added `train`, `eval`, `render`, and `compare` subcommands.",
-        "- Added timestamped `logs/` run folders with config snapshots, JSONL/CSV logs, checkpoints, summaries, and plots.",
-        "- Added deterministic evaluation with per-episode trajectory CSV files and target-vs-actual plots.",
-        "- Added normalized observations and meter-scale reward for the improved variant.",
-        "- Added `residual_pd` mode so SAC learns bounded residual torque on top of the existing PD baseline.", "",
-        "## Controlled Comparison", "",
-        f"- Legacy direct-torque untrained mean error: `{before['mean_tracking_error_m']:.6f} m`",
-        f"- Improved residual-PD untrained mean error: `{after['mean_tracking_error_m']:.6f} m`",
-        f"- Mean-error ratio legacy/improved: `{ratio:.2f}x`",
-        f"- Legacy success rate: `{before['success_rate']:.3f}`",
-        f"- Improved success rate: `{after['success_rate']:.3f}`", "",
+        "## PDF Direct-Torque Evaluation", "",
+        f"- Mean tracking error: `{rows[0]['mean_tracking_error_m']:.6f} m`",
+        f"- RMS tracking error: `{rows[0]['rms_tracking_error_m']:.6f} m`",
+        f"- Max tracking error: `{rows[0]['max_tracking_error_m']:.6f} m`",
+        f"- Success rate: `{rows[0]['success_rate']:.3f}`", "",
         "## Remaining Work", "",
-        "- Longer training is still needed before claiming convergence of the residual SAC policy.",
-        "- Next tuning should focus on residual action limits, reward weights, and target-velocity tracking.",
+        "- Full PDF fidelity still requires replacing the 2-DoF arm with the 3-DoF Phantom Omni model.",
+        "- Full PDF fidelity still requires the GAIL discriminator and expert-demonstration loop.",
     ]
     with (Path(path) / "REPORT.md").open("w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -649,7 +670,7 @@ def render(config):
             f"steps={total_steps} mode={config.control_mode}",
             f"q=[{arm.q[0]:.2f}, {arm.q[1]:.2f}] dq=[{arm.dq[0]:.2f}, {arm.dq[1]:.2f}]",
             f"err={last['ee_error_m']:.4f} m reward={last['reward']:.2f}",
-            f"tau=[{tau[0]:.2f}, {tau[1]:.2f}] residual=[{tau_res[0]:.2f}, {tau_res[1]:.2f}]",
+            f"tau=[{tau[0]:.2f}, {tau[1]:.2f}]",
         ]
         for i, text in enumerate(texts):
             screen.blit(font.render(text, True, (0, 0, 0)), (20, 20 + i * 25))
@@ -678,15 +699,16 @@ def parse_args():
 
     def common(p):
         p.add_argument("--variant", choices=["legacy", "improved"], default="improved")
-        p.add_argument("--control-mode", choices=["direct_torque", "residual_pd"], default="residual_pd")
+        p.add_argument("--control-mode", choices=["direct_torque"], default="direct_torque")
+        p.add_argument("--trajectory-mode", choices=["circle", "pdf"], default="circle")
         p.add_argument("--seed", type=int, default=7)
-        p.add_argument("--total-steps", type=int, default=20000)
+        p.add_argument("--total-steps", type=int, default=3000)
         p.add_argument("--eval-interval", type=int, default=5000)
         p.add_argument("--eval-episodes", type=int, default=5)
-        p.add_argument("--max-episode-steps", type=int, default=600)
-        p.add_argument("--batch-size", type=int, default=128)
-        p.add_argument("--start-steps", type=int, default=1000)
-        p.add_argument("--update-after", type=int, default=1000)
+        p.add_argument("--max-episode-steps", type=int, default=3000)
+        p.add_argument("--batch-size", type=int, default=256)
+        p.add_argument("--start-steps", type=int, default=5000)
+        p.add_argument("--update-after", type=int, default=5000)
         p.add_argument("--action-limit", type=float, default=5.0)
         p.add_argument("--checkpoint", default="")
 
@@ -701,6 +723,7 @@ def config_from_args(args):
         command=command,
         variant=args.variant,
         control_mode=args.control_mode,
+        trajectory_mode=args.trajectory_mode,
         seed=args.seed,
         total_steps=args.total_steps,
         eval_interval=args.eval_interval,
