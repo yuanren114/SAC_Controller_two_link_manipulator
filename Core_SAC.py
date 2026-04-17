@@ -133,6 +133,7 @@ class ExperimentConfig:
     # ellipse
     ellipse_a_px: float = 120.0
     ellipse_b_px: float = 70.0
+    ellipse_center_offset_px: float = 170.0
 
     omega: float = 0.6
 
@@ -187,11 +188,12 @@ def circle_target_velocity_m(arm, t, config):
 def ellipse_target_m(arm, t, config):
     a_m = config.ellipse_a_px / arm.scale
     b_m = config.ellipse_b_px / arm.scale
+    cy_m = -config.ellipse_center_offset_px / arm.scale
     phase = config.omega * t
 
     return np.array([
         a_m * np.cos(phase),
-        b_m * np.sin(phase),
+        cy_m + b_m * np.sin(phase),
     ], dtype=np.float32)
 
 
@@ -781,6 +783,7 @@ def parse_args():
         p.add_argument("--omega", type=float, default=0.6)
         p.add_argument("--radius-px", type=float, default=60.0)
         p.add_argument("--center-offset-px", type=float, default=180.0)
+        p.add_argument("--ellipse-center-offset-px", type=float, default=170.0)
 
     for name in ["train", "train-render", "eval", "render", "compare"]:
         common(sub.add_parser(name))
