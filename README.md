@@ -16,7 +16,7 @@ The current system is a two-link planar arm with:
 Core files:
 
 - `Core_SAC.py`: arm dynamics, trajectory generation, state construction, reward/metrics, training, evaluation, rendering, logging, and CLI commands.
-- `sac_agent.py`: SAC actor, critics, replay buffer, losses, entropy tuning, LSTM layers, and checkpoint save/load.
+- `sac_agent.py`: SAC actor, critics, replay buffer, losses, entropy tuning, and checkpoint save/load.
 
 ## Features
 

@@ -104,8 +104,6 @@ class Actor(nn.Module):
         state_dim: int,
         action_dim: int,
         hidden_dims: Tuple[int, ...] = (256, 256),
-        lstm_hidden_size: int = 128,
-        lstm_num_layers: int = 1,
         log_std_min: float = -20.0,
         log_std_max: float = 2.0,
     ):
@@ -113,8 +111,6 @@ class Actor(nn.Module):
 
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.lstm_hidden_size = lstm_hidden_size
-        self.lstm_num_layers = lstm_num_layers
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
 
@@ -142,13 +138,7 @@ class Actor(nn.Module):
         # Output of backbone:
         # - features: shape (B, hidden_dims[-1])
         ####################################################################
-        self.lstm = nn.LSTM(
-            input_size=self.state_dim,
-            hidden_size=self.lstm_hidden_size,
-            num_layers=self.lstm_num_layers,
-            batch_first=True,
-        )
-        self.backbone = build_mlp(self.lstm_hidden_size, hidden_dims[:-1], hidden_dims[-1])
+        self.backbone = build_mlp(self.state_dim, hidden_dims[:-1], hidden_dims[-1])
         self.mean_head = nn.Linear(hidden_dims[-1], action_dim)
         self.log_std_head = nn.Linear(hidden_dims[-1], action_dim)
         nn.init.uniform_(self.mean_head.weight, -1e-3, 1e-3)
@@ -205,10 +195,7 @@ class Actor(nn.Module):
         # In short:
         #   state -> features -> (mean, log_std)
         ####################################################################
-        if state.ndim == 2:
-            state = state.unsqueeze(1)
-        lstm_out, _ = self.lstm(state)
-        mlp_head = self.backbone(lstm_out[:, -1, :])
+        mlp_head = self.backbone(state)
         mean = self.mean_head(mlp_head)
         log_std = self.log_std_head(mlp_head)
         log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
@@ -371,15 +358,11 @@ class Critic(nn.Module):
         state_dim: int,
         action_dim: int,
         hidden_dims: Tuple[int, ...] = (256, 256),
-        lstm_hidden_size: int = 128,
-        lstm_num_layers: int = 1,
     ):
         super().__init__()
 
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.lstm_hidden_size = lstm_hidden_size
-        self.lstm_num_layers = lstm_num_layers
 
         ####################################################################
         # TODO:
@@ -396,13 +379,7 @@ class Critic(nn.Module):
         # Why concatenate state and action?
         # - Because Q(s, a) depends on both
         ####################################################################
-        self.lstm = nn.LSTM(
-            input_size=self.state_dim,
-            hidden_size=self.lstm_hidden_size,
-            num_layers=self.lstm_num_layers,
-            batch_first=True,
-        )
-        self.q_net = build_mlp(self.lstm_hidden_size + action_dim, hidden_dims, 1)
+        self.q_net = build_mlp(state_dim + action_dim, hidden_dims, 1)
         ####################################################################
         #                          END OF YOUR CODE                        #
         ####################################################################
@@ -433,10 +410,7 @@ class Critic(nn.Module):
         # Step 1) Concatenate state and action along dim=-1
         # Step 2) Feed the result into q_net
         ####################################################################
-        if state.ndim == 2:
-            state = state.unsqueeze(1)
-        lstm_out, _ = self.lstm(state)
-        x = torch.concatenate([lstm_out[:, -1, :], action], dim=-1)
+        x = torch.cat([state, action], dim=-1)
         q_value = self.q_net(x)
         ####################################################################
         #                          END OF YOUR CODE                        #
