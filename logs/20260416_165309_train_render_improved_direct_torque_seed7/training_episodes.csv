@@ -1,2 +1,0 @@
-action_saturation_rate,episode,episode_reward,episode_steps,final_dq_abs_max,final_q_abs_max,final_tracking_error_m,max_tracking_error_m,mean_action_norm,mean_tracking_error_m,replay_size,rms_tracking_error_m,success_rate,total_steps
-0.02,0,-1240.7916827310926,3000,1.5338647920653425,2.4003242922478676,0.20843638610839843,0.40998687744140627,0.767689285269628,0.1892679067001343,3000,0.1988167778270371,0.0,3000

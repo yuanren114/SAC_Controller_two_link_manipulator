@@ -1,2 +1,13 @@
-.vscode/
+# logs
+logs/
+
+# model checkpoints
+*.pt
+
+# training data
+*.csv
+*.jsonl
+
+# temp
 __pycache__/
+*.pyc
