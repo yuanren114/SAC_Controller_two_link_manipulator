@@ -1,0 +1,23 @@
+{
+  "action_limit": 5.0,
+  "batch_size": 256,
+  "checkpoint": "",
+  "command": "train_render",
+  "control_mode": "direct_torque",
+  "deterministic_eval": true,
+  "dt": 0.01,
+  "ellipse_a_px": 120.0,
+  "ellipse_b_px": 70.0,
+  "eval_episodes": 2,
+  "eval_interval": 6000,
+  "max_episode_steps": 3000,
+  "omega": 0.6,
+  "replay_size": 1000000,
+  "seed": 7,
+  "start_steps": 5000,
+  "total_steps": 24000,
+  "trajectory_mode": "ellipse",
+  "update_after": 5000,
+  "update_every": 1,
+  "variant": "improved"
+}

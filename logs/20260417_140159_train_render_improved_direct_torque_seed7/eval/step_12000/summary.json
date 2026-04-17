@@ -1,0 +1,20 @@
+{
+  "action_saturation_rate_mean": 0.0,
+  "action_saturation_rate_std": 0.0,
+  "episode_reward_mean": -391.27579370976974,
+  "episode_reward_std": 0.0,
+  "episodes": 2,
+  "final_tracking_error_m_mean": 0.06378788375854492,
+  "final_tracking_error_m_std": 0.0,
+  "max_tracking_error_m_mean": 0.20128659057617188,
+  "max_tracking_error_m_std": 0.0,
+  "mean_action_norm_mean": 0.9258460652828217,
+  "mean_action_norm_std": 0.0,
+  "mean_tracking_error_m_mean": 0.08062578757222492,
+  "mean_tracking_error_m_std": 0.0,
+  "rms_tracking_error_m_mean": 0.08468313688186735,
+  "rms_tracking_error_m_std": 0.0,
+  "step_label": "step_12000",
+  "success_rate_mean": 0.0,
+  "success_rate_std": 0.0
+}

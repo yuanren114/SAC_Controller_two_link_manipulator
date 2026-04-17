@@ -113,7 +113,7 @@ class ExperimentConfig:
     command: str = "train"
     variant: str = "improved"
     control_mode: str = "direct_torque"
-    trajectory_mode: str = "circle"
+    trajectory_mode: str = "ellipse"
     seed: int = 7
     total_steps: int = 3000
     eval_interval: int = 5000
@@ -125,9 +125,17 @@ class ExperimentConfig:
     update_after: int = 5000
     update_every: int = 1
     dt: float = 0.01
+
+    # circle
     radius_px: float = 60.0
     center_offset_px: float = 180.0
-    omega: float = 0.5
+
+    # ellipse
+    ellipse_a_px: float = 120.0
+    ellipse_b_px: float = 70.0
+
+    omega: float = 0.6
+
     action_limit: float = 5.0
     checkpoint: str = ""
     deterministic_eval: bool = True
@@ -176,8 +184,29 @@ def circle_target_velocity_m(arm, t, config):
     phase = config.omega * t
     return radius_m * config.omega * np.array([-np.sin(phase), np.cos(phase)], dtype=np.float32)
 
+def ellipse_target_m(arm, t, config):
+    a_m = config.ellipse_a_px / arm.scale
+    b_m = config.ellipse_b_px / arm.scale
+    phase = config.omega * t
+
+    return np.array([
+        a_m * np.cos(phase),
+        b_m * np.sin(phase),
+    ], dtype=np.float32)
+
+
+def ellipse_target_velocity_m(arm, t, config):
+    a_m = config.ellipse_a_px / arm.scale
+    b_m = config.ellipse_b_px / arm.scale
+    phase = config.omega * t
+    return np.array([
+        -a_m * config.omega * np.sin(phase),
+         b_m * config.omega * np.cos(phase),
+    ], dtype=np.float32)
 
 def target_at_m(arm, t, config):
+    if config.trajectory_mode == "ellipse":
+        return ellipse_target_m(arm, t, config), ellipse_target_velocity_m(arm, t, config)
     if config.trajectory_mode == "circle":
         return circle_target_m(arm, t, config), circle_target_velocity_m(arm, t, config)
     if config.trajectory_mode == "pdf":
@@ -250,8 +279,19 @@ def build_state(arm, ref, config, next_state=False):
 def reset_arm(arm, config, t=None):
     if t is None:
         t = 0.0
-    arm.q = np.array([-0.3, 0.3], dtype=np.float64)
-    arm.dq = np.zeros(2, dtype=np.float64)
+
+    xd_m, _ = target_at_m(arm, t, config)
+    start_px = point_m_to_px(arm, xd_m)
+    q0 = ik_for_point(arm, start_px).astype(np.float64)
+
+    xd1_m, _ = target_at_m(arm, t + config.dt, config)
+    start1_px = point_m_to_px(arm, xd1_m)
+    q1 = ik_for_point(arm, start1_px).astype(np.float64)
+    dq0 = np.clip((q1 - q0) / config.dt, -10.0, 10.0)
+
+    arm.q = q0
+    arm.dq = dq0
+    arm.qdd = np.zeros(2, dtype=np.float64)
     return t
 
 
@@ -544,14 +584,37 @@ def train(config):
         step_log.flush()
         if episode % 5 == 0:
             print(f"episode={episode} steps={state['total_steps']} reward={metrics['episode_reward']:.2f} mean_err_m={metrics['mean_tracking_error_m']:.4f}")
-        crossed_eval = state["total_steps"] >= config.total_steps or state["total_steps"] // config.eval_interval > max(0, (state["total_steps"] - metrics["episode_steps"]) // config.eval_interval)
+        crossed_eval = (
+            state["total_steps"] >= config.total_steps
+            or state["total_steps"] // config.eval_interval
+            > max(0, (state["total_steps"] - metrics["episode_steps"]) // config.eval_interval)
+        )
+
         if crossed_eval:
             label = f"step_{state['total_steps']}"
             agent.save(ckpt_dir / f"{label}.pt")
+
             summary = evaluate(agent, config, path, label)
+
+            print("\n===== EVAL REPORT =====")
+            print(f"Step: {state['total_steps']}")
+            print(f"Episodes: {summary['episodes']}")
+            print(f"Mean tracking error:  {summary['mean_tracking_error_m_mean']:.6f} m")
+            print(f"RMS tracking error:   {summary['rms_tracking_error_m_mean']:.6f} m")
+            print(f"Max tracking error:   {summary['max_tracking_error_m_mean']:.6f} m")
+            print(f"Final tracking error: {summary['final_tracking_error_m_mean']:.6f} m")
+            print(f"Episode reward:       {summary['episode_reward_mean']:.6f}")
+            print(f"Success rate:         {summary['success_rate_mean']:.3f}")
+            print(f"Mean action norm:     {summary['mean_action_norm_mean']:.6f}")
+            print(f"Action sat. rate:     {summary['action_saturation_rate_mean']:.3f}")
+            print(f"Current best error:   {best:.6f} m")
+
             if summary["mean_tracking_error_m_mean"] < best:
                 best = summary["mean_tracking_error_m_mean"]
                 agent.save(ckpt_dir / "best.pt")
+                print(f"New best checkpoint saved: {best:.6f} m")
+
+            print("=======================\n")
         episode += 1
     agent.save(ckpt_dir / "final.pt")
     final_eval = evaluate(agent, config, path, "final")
@@ -700,17 +763,24 @@ def parse_args():
     def common(p):
         p.add_argument("--variant", choices=["legacy", "improved"], default="improved")
         p.add_argument("--control-mode", choices=["direct_torque"], default="direct_torque")
-        p.add_argument("--trajectory-mode", choices=["circle", "pdf"], default="circle")
+        p.add_argument("--trajectory-mode", choices=["ellipse", "circle", "pdf"], default="ellipse")
         p.add_argument("--seed", type=int, default=7)
-        p.add_argument("--total-steps", type=int, default=3000)
-        p.add_argument("--eval-interval", type=int, default=5000)
-        p.add_argument("--eval-episodes", type=int, default=5)
+        p.add_argument("--total-steps", type=int, default=24000)
+        p.add_argument("--eval-interval", type=int, default=6000)
+        p.add_argument("--eval-episodes", type=int, default=2)
         p.add_argument("--max-episode-steps", type=int, default=3000)
         p.add_argument("--batch-size", type=int, default=256)
         p.add_argument("--start-steps", type=int, default=5000)
         p.add_argument("--update-after", type=int, default=5000)
         p.add_argument("--action-limit", type=float, default=5.0)
         p.add_argument("--checkpoint", default="")
+        p.add_argument("--ellipse-a-px", type=float, default=120.0)
+        p.add_argument("--ellipse-b-px", type=float, default=70.0)
+        # p.add_argument("--ellipse-cx-px", type=float, default=400.0)
+        # p.add_argument("--ellipse-cy-px", type=float, default=500.0)
+        p.add_argument("--omega", type=float, default=0.6)
+        p.add_argument("--radius-px", type=float, default=60.0)
+        p.add_argument("--center-offset-px", type=float, default=180.0)
 
     for name in ["train", "train-render", "eval", "render", "compare"]:
         common(sub.add_parser(name))
@@ -734,6 +804,13 @@ def config_from_args(args):
         update_after=args.update_after,
         action_limit=args.action_limit,
         checkpoint=args.checkpoint,
+        radius_px=args.radius_px,
+        center_offset_px=args.center_offset_px,
+        ellipse_a_px=args.ellipse_a_px,
+        ellipse_b_px=args.ellipse_b_px,
+        # ellipse_cx_px=args.ellipse_cx_px,
+        # ellipse_cy_px=args.ellipse_cy_px,
+        omega=args.omega,
     )
 
 
