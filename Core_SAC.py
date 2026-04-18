@@ -124,7 +124,7 @@ class ExperimentConfig:
     start_steps: int = 5000
     update_after: int = 5000
     update_every: int = 1
-    dt: float = 0.01
+    dt: float = 1/60
 
     # circle
     radius_px: float = 60.0
