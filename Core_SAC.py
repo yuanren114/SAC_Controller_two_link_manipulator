@@ -4,6 +4,7 @@ import json
 import math
 import random
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -21,8 +22,34 @@ except Exception:
     plt = None
 
 
+class EpisodeDisturbance:
+    def __init__(self, enabled=False, spike_step=None, spike_value=None):
+        self.enabled = enabled
+        self.spike_step = spike_step
+        self.spike_value = np.zeros(2, dtype=np.float64) if spike_value is None else np.asarray(spike_value, dtype=np.float64)
+        self.triggered = False
+
+    def value_at(self, step_idx):
+        if not self.enabled:
+            return np.zeros(2, dtype=np.float64)
+        if self.spike_step is None:
+            return np.zeros(2, dtype=np.float64)
+        if step_idx == self.spike_step and not self.triggered:
+            self.triggered = True
+            return self.spike_value.copy()
+        return np.zeros(2, dtype=np.float64)
+
+
 class TwoLink:
-    def __init__(self, sim_mode="Controllerbias"):
+    def __init__(
+        self,
+        sim_mode="nominal",
+        m1_nominal=2.0,
+        m2_nominal=1.5,
+        m1_actual=None,
+        m2_actual=None,
+        controller_bias_std=0.0,
+    ):
         self.l1_draw = 180
         self.l2_draw = 140
         self.thickness = 16
@@ -30,39 +57,61 @@ class TwoLink:
         self.scale = 1000.0
         self.l1 = self.l1_draw / self.scale
         self.l2 = self.l2_draw / self.scale
-        self.m1 = 2.0
-        self.m2 = 1.5
+
+        self.m1_nominal = float(m1_nominal)
+        self.m2_nominal = float(m2_nominal)
+        self.m1_actual = float(m1_nominal if m1_actual is None else m1_actual)
+        self.m2_actual = float(m2_nominal if m2_actual is None else m2_actual)
+        self.controller_bias_std = float(controller_bias_std)
+
         self.g = 9.81
         self.base = np.array([400.0, 500.0], dtype=np.float64)
         self.q = np.array([0.0, 0.0], dtype=np.float64)
         self.dq = np.array([0.0, 0.0], dtype=np.float64)
         self.qdd = np.array([0.0, 0.0], dtype=np.float64)
 
-    def dynamics_terms(self, q, dq):
+    def dynamics_terms(self, q, dq, use_nominal=False, rng=None):
         q1, q2 = q
         dq1, dq2 = dq
-        m1, m2 = self.m1, self.m2
+
+        if use_nominal:
+            m1, m2 = self.m1_nominal, self.m2_nominal
+        else:
+            m1, m2 = self.m1_actual, self.m2_actual
+
         l1, l2 = self.l1, self.l2
         lc1, lc2 = l1 / 2, l2 / 2
-        I1 = (1 / 12) * m1 * l1**2
-        I2 = (1 / 12) * m2 * l2**2
+        I1 = (1.0 / 12.0) * m1 * l1**2
+        I2 = (1.0 / 12.0) * m2 * l2**2
         c2 = math.cos(q2)
         s2 = math.sin(q2)
-        M11 = I1 + I2 + m1 * lc1**2 + m2 * (l1**2 + lc2**2 + 2 * l1 * lc2 * c2)
+
+        M11 = I1 + I2 + m1 * lc1**2 + m2 * (l1**2 + lc2**2 + 2.0 * l1 * lc2 * c2)
         M12 = I2 + m2 * (lc2**2 + l1 * lc2 * c2)
         M = np.array([[M11, M12], [M12, I2 + m2 * lc2**2]], dtype=np.float64)
+
         h = m2 * l1 * lc2 * s2
-        C = np.array([-h * (2 * dq1 * dq2 + dq2**2), h * dq1**2], dtype=np.float64)
+        C = np.array([
+            -h * (2.0 * dq1 * dq2 + dq2**2),
+            h * dq1**2,
+        ], dtype=np.float64)
+
         G = np.array([
             (m1 * lc1 + m2 * l1) * self.g * math.cos(q1) + m2 * lc2 * self.g * math.cos(q1 + q2),
             m2 * lc2 * self.g * math.cos(q1 + q2),
         ], dtype=np.float64)
+
+        if use_nominal and self.controller_bias_std > 0.0:
+            local_rng = rng if rng is not None else np.random
+            G = G + local_rng.normal(0.0, self.controller_bias_std, size=2)
+
         return M, C, G
 
-    def step(self, tau, dt):
+    def step(self, tau, dt, disturbance=None):
         tau = np.clip(np.asarray(tau, dtype=np.float64), -5.0, 5.0)
-        M, C, G = self.dynamics_terms(self.q, self.dq)
-        qdd = np.linalg.solve(M, tau - C - G - 0.5 * self.dq)
+        disturbance = np.zeros(2, dtype=np.float64) if disturbance is None else np.asarray(disturbance, dtype=np.float64)
+        M, C, G = self.dynamics_terms(self.q, self.dq, use_nominal=False)
+        qdd = np.linalg.solve(M, tau + disturbance - C - G - 0.5 * self.dq)
         if not np.all(np.isfinite(qdd)):
             qdd = np.zeros_like(self.dq)
         self.qdd = np.clip(qdd, -100.0, 100.0)
@@ -82,16 +131,16 @@ class TwoLink:
 
     def ik4traject(self, x, y):
         r2 = x**2 + y**2
-        c2 = np.clip((r2 - self.l1**2 - self.l2**2) / (2 * self.l1 * self.l2), -1.0, 1.0)
-        q2 = math.atan2(math.sqrt(max(0.0, 1 - c2**2)), c2)
+        c2 = np.clip((r2 - self.l1**2 - self.l2**2) / (2.0 * self.l1 * self.l2), -1.0, 1.0)
+        q2 = math.atan2(math.sqrt(max(0.0, 1.0 - c2**2)), c2)
         q1 = math.atan2(y, x) - math.atan2(self.l2 * math.sin(q2), self.l1 + self.l2 * math.cos(q2))
         return np.array([q1, q2], dtype=np.float32)
 
-    def pd_torque(self, q_target, dq_target):
+    def pd_torque(self, q_target, dq_target, rng=None):
         Kp = np.array([40.0, 35.0], dtype=np.float64)
         Kd = np.array([10.0, 8.0], dtype=np.float64)
-        _, _, G = self.dynamics_terms(self.q, self.dq)
-        tau = Kp * (q_target.astype(np.float64) - self.q) + Kd * (dq_target.astype(np.float64) - self.dq) + G
+        _, _, G_nom = self.dynamics_terms(self.q, self.dq, use_nominal=True, rng=rng)
+        tau = Kp * (q_target.astype(np.float64) - self.q) + Kd * (dq_target.astype(np.float64) - self.dq) + G_nom
         return np.clip(tau, -20.0, 20.0)
 
     def draw_link(self, screen, p_start, p_end, thickness, color):
@@ -124,22 +173,37 @@ class ExperimentConfig:
     start_steps: int = 5000
     update_after: int = 5000
     update_every: int = 1
-    dt: float = 1/60
+    dt: float = 1 / 60
 
-    # circle
     radius_px: float = 60.0
     center_offset_px: float = 180.0
-
-    # ellipse
     ellipse_a_px: float = 120.0
     ellipse_b_px: float = 70.0
     ellipse_center_offset_px: float = 170.0
-
     omega: float = 0.6
 
     action_limit: float = 5.0
     checkpoint: str = ""
     deterministic_eval: bool = True
+
+    m1_nominal: float = 2.0
+    m2_nominal: float = 1.5
+    train_m1_actual: float = 2.0
+    train_m2_actual: float = 1.5
+    test_m1_actual: float = 1.9
+    test_m2_actual: float = 1.5
+    controller_bias_std: float = 0.0
+
+    train_use_disturbance: bool = False
+    test_use_disturbance: bool = True
+    disturbance_seed_train: int = 701
+    disturbance_seed_test: int = 1701
+    disturbance_min_step: int = 360
+    disturbance_max_step: int = 1200
+    disturbance_low: float = -5.0
+    disturbance_high: float = 5.0
+
+    time_render_compute_only: bool = True
 
 
 def set_seed(seed):
@@ -185,12 +249,12 @@ def circle_target_velocity_m(arm, t, config):
     phase = config.omega * t
     return radius_m * config.omega * np.array([-np.sin(phase), np.cos(phase)], dtype=np.float32)
 
+
 def ellipse_target_m(arm, t, config):
     a_m = config.ellipse_a_px / arm.scale
     b_m = config.ellipse_b_px / arm.scale
     cy_m = -config.ellipse_center_offset_px / arm.scale
     phase = config.omega * t
-
     return np.array([
         a_m * np.cos(phase),
         cy_m + b_m * np.sin(phase),
@@ -203,8 +267,9 @@ def ellipse_target_velocity_m(arm, t, config):
     phase = config.omega * t
     return np.array([
         -a_m * config.omega * np.sin(phase),
-         b_m * config.omega * np.cos(phase),
+        b_m * config.omega * np.cos(phase),
     ], dtype=np.float32)
+
 
 def target_at_m(arm, t, config):
     if config.trajectory_mode == "ellipse":
@@ -231,11 +296,16 @@ def ref_at(arm, t, dt, config):
     dq = np.clip((q1 - q) / dt, -10.0, 10.0).astype(np.float32)
     dq1 = np.clip((q2 - q1) / dt, -10.0, 10.0).astype(np.float32)
     return {
-        "xd": xd, "xd_next": xd1,
-        "xd_m": xd_m, "xd_next_m": xd1_m,
-        "dxd_m": dxd_m, "dxd_next_m": dxd1_m,
-        "q_des": q, "q_des_next": q1,
-        "dq_des": dq, "dq_des_next": dq1,
+        "xd": xd,
+        "xd_next": xd1,
+        "xd_m": xd_m,
+        "xd_next_m": xd1_m,
+        "dxd_m": dxd_m,
+        "dxd_next_m": dxd1_m,
+        "q_des": q,
+        "q_des_next": q1,
+        "dq_des": dq,
+        "dq_des_next": dq1,
     }
 
 
@@ -265,7 +335,6 @@ def state_dim(config):
 
 def build_state(arm, ref, config, next_state=False):
     ee = ee_px(arm)
-    xd = ref["xd_next"] if next_state else ref["xd"]
     q, dq = arm.q.astype(np.float32), arm.dq.astype(np.float32)
     x = local_m(arm, ee)
     dx = ee_velocity_m(arm)
@@ -273,24 +342,19 @@ def build_state(arm, ref, config, next_state=False):
     dxd_m = ref["dxd_next_m"] if next_state else ref["dxd_m"]
     e = x - xd_m
     de = dx - dxd_m
-    return np.hstack([
-        q, dq, x, dx, xd_m, dxd_m, e, de,
-    ]).astype(np.float32)
+    return np.hstack([q, dq, x, dx, xd_m, dxd_m, e, de]).astype(np.float32)
 
 
 def reset_arm(arm, config, t=None):
     if t is None:
         t = 0.0
-
     xd_m, _ = target_at_m(arm, t, config)
     start_px = point_m_to_px(arm, xd_m)
     q0 = ik_for_point(arm, start_px).astype(np.float64)
-
     xd1_m, _ = target_at_m(arm, t + config.dt, config)
     start1_px = point_m_to_px(arm, xd1_m)
     q1 = ik_for_point(arm, start1_px).astype(np.float64)
     dq0 = np.clip((q1 - q0) / config.dt, -10.0, 10.0)
-
     arm.q = q0
     arm.dq = dq0
     arm.qdd = np.zeros(2, dtype=np.float64)
@@ -307,6 +371,37 @@ def make_agent(config):
     )
 
 
+def build_arm(config, phase="train"):
+    if phase == "train":
+        m1_actual = config.train_m1_actual
+        m2_actual = config.train_m2_actual
+    else:
+        m1_actual = config.test_m1_actual
+        m2_actual = config.test_m2_actual
+    return TwoLink(
+        sim_mode=phase,
+        m1_nominal=config.m1_nominal,
+        m2_nominal=config.m2_nominal,
+        m1_actual=m1_actual,
+        m2_actual=m2_actual,
+        controller_bias_std=config.controller_bias_std,
+    )
+
+
+def build_episode_disturbance(config, phase, episode_idx):
+    use_disturbance = config.train_use_disturbance if phase == "train" else config.test_use_disturbance
+    if not use_disturbance:
+        return EpisodeDisturbance(enabled=False)
+
+    seed_base = config.disturbance_seed_train if phase == "train" else config.disturbance_seed_test
+    rng = np.random.default_rng(seed_base + int(episode_idx))
+    hi = max(config.disturbance_min_step + 1, min(config.disturbance_max_step, config.max_episode_steps - 1))
+    lo = min(config.disturbance_min_step, hi - 1)
+    spike_step = int(rng.integers(lo, hi))
+    spike_value = rng.uniform(config.disturbance_low, config.disturbance_high, size=2)
+    return EpisodeDisturbance(enabled=True, spike_step=spike_step, spike_value=spike_value)
+
+
 def control(arm, agent, state, ref, total_steps, config, deterministic=False):
     if total_steps < config.start_steps and not deterministic:
         action_env = np.random.uniform(-config.action_limit, config.action_limit, size=2).astype(np.float32)
@@ -314,13 +409,14 @@ def control(arm, agent, state, ref, total_steps, config, deterministic=False):
     else:
         action_env, action_norm = agent.select_action(state, deterministic=deterministic)
         action_env, action_norm = action_env.astype(np.float32), action_norm.astype(np.float32)
+
     tau_pd = np.zeros(2, dtype=np.float32)
     tau_res = np.clip(action_env, -config.action_limit, config.action_limit).astype(np.float32)
     tau = tau_res.copy()
     return tau, tau_res, tau_pd, action_norm
 
 
-def reward_metrics(arm, ref, prev_ee, action_norm, tau, tau_res, config):
+def reward_metrics(arm, ref, prev_ee, action_norm, tau, tau_res, disturbance, config):
     ee = ee_px(arm)
     q, dq = arm.q.astype(np.float32), arm.dq.astype(np.float32)
     err_px = float(np.linalg.norm(ee - ref["xd_next"])) if np.all(np.isfinite(ee)) else 1e6
@@ -340,6 +436,7 @@ def reward_metrics(arm, ref, prev_ee, action_norm, tau, tau_res, config):
         "action_saturation": float(np.mean(np.abs(action_norm) > 0.98)),
         "tau_total_norm": float(np.linalg.norm(tau)),
         "tau_residual_norm": float(np.linalg.norm(tau_res)),
+        "disturbance_norm": float(np.linalg.norm(disturbance)),
         "q_abs_max": float(np.max(np.abs(q))),
         "dq_abs_max": float(np.max(np.abs(dq))),
         "success": float(err_m < 0.02),
@@ -347,12 +444,12 @@ def reward_metrics(arm, ref, prev_ee, action_norm, tau, tau_res, config):
     return float(reward), metrics
 
 
-def summarize(rows, total_reward):
+def summarize(rows, total_reward, timing_stats=None, disturbance=None):
     errors = np.array([r["ee_error_m"] for r in rows], dtype=np.float64)
     acts = np.array([r["action_norm"] for r in rows], dtype=np.float64)
     sats = np.array([r["action_saturation"] for r in rows], dtype=np.float64)
     succ = np.array([r["success"] for r in rows], dtype=np.float64)
-    return {
+    out = {
         "episode_reward": float(total_reward),
         "episode_steps": len(rows),
         "mean_tracking_error_m": float(np.mean(errors)),
@@ -365,50 +462,14 @@ def summarize(rows, total_reward):
         "final_q_abs_max": float(max(abs(rows[-1]["q1"]), abs(rows[-1]["q2"]))),
         "final_dq_abs_max": float(max(abs(rows[-1]["dq1"]), abs(rows[-1]["dq2"]))),
     }
-
-
-def run_episode(agent, config, train=False, replay_buffer=None, update_state=None, deterministic=False):
-    arm = TwoLink()
-    t = reset_arm(arm, config)
-    rows, total_reward, last_info = [], 0.0, {}
-    for step in range(config.max_episode_steps):
-        ref = ref_at(arm, t, config.dt, config)
-        state = build_state(arm, ref, config)
-        prev_ee = ee_px(arm)
-        total_seen = update_state["total_steps"] if update_state else 0
-        tau, tau_res, tau_pd, action_norm = control(arm, agent, state, ref, total_seen, config, deterministic)
-        arm.step(tau, config.dt)
-        next_ref = ref_at(arm, t, config.dt, config)
-        next_state = build_state(arm, next_ref, config, next_state=True)
-        reward, metrics = reward_metrics(arm, next_ref, prev_ee, action_norm, tau, tau_res, config)
-        bad = not np.all(np.isfinite(next_state)) or np.any(np.abs(arm.q) > np.pi) or np.any(np.abs(arm.dq) > 20.0)
-        done = step + 1 >= config.max_episode_steps or bad
-        if train:
-            replay_buffer.push(state, action_norm, reward, next_state, float(done))
-            update_state["episode_reward"] += reward
-            update_state["total_steps"] += 1
-            if len(replay_buffer) >= config.batch_size and update_state["total_steps"] >= config.update_after:
-                for _ in range(config.update_every):
-                    last_info = agent.update(replay_buffer, config.batch_size)
-                    update_state["last_info"] = last_info
-        total_reward += reward
-        ee = ee_px(arm)
-        rows.append({
-            "step": step, "t": t,
-            "x_target_px": float(next_ref["xd_next"][0]), "y_target_px": float(next_ref["xd_next"][1]),
-            "x_ee_px": float(ee[0]), "y_ee_px": float(ee[1]),
-            "q1": float(arm.q[0]), "q2": float(arm.q[1]),
-            "dq1": float(arm.dq[0]), "dq2": float(arm.dq[1]),
-            "tau1": float(tau[0]), "tau2": float(tau[1]),
-            "tau_pd1": float(tau_pd[0]), "tau_pd2": float(tau_pd[1]),
-            **metrics,
-        })
-        t += config.dt
-        if done:
-            break
-    out = summarize(rows, total_reward)
-    out.update(last_info)
-    return out, rows
+    if timing_stats is not None:
+        out.update(timing_stats)
+    if disturbance is not None:
+        out["disturbance_enabled"] = float(disturbance.enabled)
+        out["disturbance_spike_step"] = -1 if disturbance.spike_step is None else int(disturbance.spike_step)
+        out["disturbance_spike_tau1"] = float(disturbance.spike_value[0])
+        out["disturbance_spike_tau2"] = float(disturbance.spike_value[1])
+    return out
 
 
 def append_csv(path, row, fields=None):
@@ -509,9 +570,16 @@ def plot_eval(csv_path, out_path):
 
 def aggregate_eval(rows):
     keys = [
-        "episode_reward", "mean_tracking_error_m", "rms_tracking_error_m",
-        "max_tracking_error_m", "final_tracking_error_m", "success_rate",
-        "mean_action_norm", "action_saturation_rate",
+        "episode_reward",
+        "mean_tracking_error_m",
+        "rms_tracking_error_m",
+        "max_tracking_error_m",
+        "final_tracking_error_m",
+        "success_rate",
+        "mean_action_norm",
+        "action_saturation_rate",
+        "mean_step_compute_time_ms",
+        "mean_step_full_loop_time_ms",
     ]
     out = {"episodes": len(rows)}
     for key in keys:
@@ -521,19 +589,108 @@ def aggregate_eval(rows):
     return out
 
 
+def run_episode(agent, config, train=False, replay_buffer=None, update_state=None, deterministic=False, episode_idx=0, phase=None):
+    phase = phase or ("train" if train else "test")
+    arm = build_arm(config, phase=phase)
+    disturbance = build_episode_disturbance(config, phase=phase, episode_idx=episode_idx)
+    t = reset_arm(arm, config)
+    rows, total_reward, last_info = [], 0.0, {}
+    compute_step_times = []
+    full_step_times = []
+
+    for step in range(config.max_episode_steps):
+        loop_t0 = time.perf_counter()
+        ref = ref_at(arm, t, config.dt, config)
+        state = build_state(arm, ref, config)
+        prev_ee = ee_px(arm)
+        total_seen = update_state["total_steps"] if update_state else 0
+
+        compute_t0 = time.perf_counter()
+        tau, tau_res, tau_pd, action_norm = control(arm, agent, state, ref, total_seen, config, deterministic)
+        spike = disturbance.value_at(step)
+        arm.step(tau, config.dt, disturbance=spike)
+        next_ref = ref_at(arm, t, config.dt, config)
+        next_state = build_state(arm, next_ref, config, next_state=True)
+        reward, metrics = reward_metrics(arm, next_ref, prev_ee, action_norm, tau, tau_res, spike, config)
+        compute_t1 = time.perf_counter()
+        compute_step_times.append(compute_t1 - compute_t0)
+
+        bad = not np.all(np.isfinite(next_state)) or np.any(np.abs(arm.q) > np.pi) or np.any(np.abs(arm.dq) > 20.0)
+        done = step + 1 >= config.max_episode_steps or bad
+
+        if train:
+            replay_buffer.push(state, action_norm, reward, next_state, float(done))
+            update_state["episode_reward"] += reward
+            update_state["total_steps"] += 1
+            if len(replay_buffer) >= config.batch_size and update_state["total_steps"] >= config.update_after:
+                for _ in range(config.update_every):
+                    last_info = agent.update(replay_buffer, config.batch_size)
+                    update_state["last_info"] = last_info
+
+        total_reward += reward
+        ee = ee_px(arm)
+        row = {
+            "step": step,
+            "t": t,
+            "x_target_px": float(next_ref["xd_next"][0]),
+            "y_target_px": float(next_ref["xd_next"][1]),
+            "x_ee_px": float(ee[0]),
+            "y_ee_px": float(ee[1]),
+            "q1": float(arm.q[0]),
+            "q2": float(arm.q[1]),
+            "dq1": float(arm.dq[0]),
+            "dq2": float(arm.dq[1]),
+            "tau1": float(tau[0]),
+            "tau2": float(tau[1]),
+            "tau_pd1": float(tau_pd[0]),
+            "tau_pd2": float(tau_pd[1]),
+            "disturbance1": float(spike[0]),
+            "disturbance2": float(spike[1]),
+            "step_compute_time_ms": float((compute_t1 - compute_t0) * 1000.0),
+            **metrics,
+        }
+        rows.append(row)
+        t += config.dt
+        loop_t1 = time.perf_counter()
+        full_step_times.append(loop_t1 - loop_t0)
+
+        if done:
+            break
+
+    timing_stats = {
+        "mean_step_compute_time_ms": float(np.mean(compute_step_times) * 1000.0),
+        "std_step_compute_time_ms": float(np.std(compute_step_times) * 1000.0),
+        "mean_step_full_loop_time_ms": float(np.mean(full_step_times) * 1000.0),
+        "std_step_full_loop_time_ms": float(np.std(full_step_times) * 1000.0),
+    }
+    out = summarize(rows, total_reward, timing_stats=timing_stats, disturbance=disturbance)
+    out.update(last_info)
+    return out, rows
+
+
 def evaluate(agent, config, path, step_label="final", episodes=None):
     agent.eval_mode()
     eval_dir = Path(path) / "eval" / str(step_label)
     eval_dir.mkdir(parents=True, exist_ok=True)
     metrics_rows = []
     for ep in range(episodes or config.eval_episodes):
-        metrics, rows = run_episode(agent, config, train=False, deterministic=config.deterministic_eval)
+        metrics, rows = run_episode(
+            agent,
+            config,
+            train=False,
+            deterministic=config.deterministic_eval,
+            episode_idx=ep,
+            phase="test",
+        )
         metrics.update({"episode": ep, "step_label": step_label})
         metrics_rows.append(metrics)
         write_rows(eval_dir / f"episode_{ep:03d}_trajectory.csv", rows)
         plot_trajectory(rows, eval_dir / f"episode_{ep:03d}_trajectory.png", f"{step_label} episode {ep}")
     summary = aggregate_eval(metrics_rows)
     summary["step_label"] = step_label
+    summary["test_m1_actual"] = float(config.test_m1_actual)
+    summary["test_m2_actual"] = float(config.test_m2_actual)
+    summary["test_use_disturbance"] = float(config.test_use_disturbance)
     with (eval_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, sort_keys=True)
     append_csv(Path(path) / "evaluation.csv", summary)
@@ -542,20 +699,29 @@ def evaluate(agent, config, path, step_label="final", episodes=None):
     return summary
 
 
-def write_summary(path, config, final_eval, best_error):
+def write_summary(path, config, final_eval, best_error, training_time_s=0.0):
     lines = [
-        "# SAC Tracking Run Summary", "",
+        "# SAC Tracking Run Summary",
+        "",
         f"- Command: `{config.command}`",
         f"- Variant: `{config.variant}`",
         f"- Control mode: `{config.control_mode}`",
         f"- Seed: `{config.seed}`",
         f"- Total training steps: `{config.total_steps}`",
+        f"- Training time: `{training_time_s:.3f} s`",
         f"- Final mean tracking error: `{final_eval['mean_tracking_error_m_mean']:.6f} m`",
         f"- Final RMS tracking error: `{final_eval['rms_tracking_error_m_mean']:.6f} m`",
         f"- Final max tracking error: `{final_eval['max_tracking_error_m_mean']:.6f} m`",
         f"- Final success rate: `{final_eval['success_rate_mean']:.3f}`",
-        f"- Best evaluation mean error: `{best_error:.6f} m`", "",
-        "The active controller applies the SAC policy output directly as joint torque bounded by the PDF action range.",
+        f"- Mean test step time (compute only): `{final_eval['mean_step_compute_time_ms_mean']:.4f} ms`",
+        f"- Mean test step time (full eval loop): `{final_eval['mean_step_full_loop_time_ms_mean']:.4f} ms`",
+        f"- Best evaluation mean error: `{best_error:.6f} m`",
+        f"- Train plant mass m1/m2: `{config.train_m1_actual:.3f}/{config.train_m2_actual:.3f}` kg",
+        f"- Test plant mass m1/m2: `{config.test_m1_actual:.3f}/{config.test_m2_actual:.3f}` kg",
+        f"- Train disturbance enabled: `{config.train_use_disturbance}`",
+        f"- Test disturbance enabled: `{config.test_use_disturbance}`",
+        "",
+        "The active controller applies the SAC policy output directly as joint torque bounded by the action limit.",
     ]
     with (Path(path) / "summary.md").open("w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -573,43 +739,68 @@ def train(config):
     ckpt_dir.mkdir(exist_ok=True)
     step_log = (path / "training_steps.jsonl").open("a", encoding="utf-8")
     state = {"total_steps": 0, "episode_reward": 0.0, "last_info": {}}
+
+    train_wall_t0 = time.perf_counter()
+
     best = evaluate(agent, config, path, "step_0", episodes=max(1, min(3, config.eval_episodes)))["mean_tracking_error_m_mean"]
     agent.save(ckpt_dir / "best.pt")
     episode = 0
     while state["total_steps"] < config.total_steps:
         state["episode_reward"] = 0.0
-        metrics, _ = run_episode(agent, config, train=True, replay_buffer=buffer, update_state=state)
-        metrics.update({"episode": episode, "total_steps": state["total_steps"], "replay_size": len(buffer)})
+        metrics, _ = run_episode(
+            agent,
+            config,
+            train=True,
+            replay_buffer=buffer,
+            update_state=state,
+            deterministic=False,
+            episode_idx=episode,
+            phase="train",
+        )
+        metrics.update({
+            "episode": episode,
+            "total_steps": state["total_steps"],
+            "replay_size": len(buffer),
+            "train_m1_actual": config.train_m1_actual,
+            "train_m2_actual": config.train_m2_actual,
+            "train_use_disturbance": float(config.train_use_disturbance),
+        })
         metrics.update(state.get("last_info", {}))
         append_csv(path / "training_episodes.csv", metrics)
         step_log.write(json.dumps(metrics, sort_keys=True) + "\n")
         step_log.flush()
+
         if episode % 5 == 0:
-            print(f"episode={episode} steps={state['total_steps']} reward={metrics['episode_reward']:.2f} mean_err_m={metrics['mean_tracking_error_m']:.4f}")
+            print(
+                f"episode={episode} steps={state['total_steps']} reward={metrics['episode_reward']:.2f} "
+                f"mean_err_m={metrics['mean_tracking_error_m']:.4f} rmse={metrics['rmse_tracking_error_m']:.4f} "
+                f"train_step_ms={metrics['mean_step_compute_time_ms']:.4f}"
+            )
+
         crossed_eval = (
             state["total_steps"] >= config.total_steps
-            or state["total_steps"] // config.eval_interval
-            > max(0, (state["total_steps"] - metrics["episode_steps"]) // config.eval_interval)
+            or state["total_steps"] // config.eval_interval > max(0, (state["total_steps"] - metrics["episode_steps"]) // config.eval_interval)
         )
 
         if crossed_eval:
             label = f"step_{state['total_steps']}"
             agent.save(ckpt_dir / f"{label}.pt")
-
             summary = evaluate(agent, config, path, label)
 
             print("\n===== EVAL REPORT =====")
             print(f"Step: {state['total_steps']}")
             print(f"Episodes: {summary['episodes']}")
-            print(f"Mean tracking error:  {summary['mean_tracking_error_m_mean']:.6f} m")
-            print(f"RMS tracking error:   {summary['rms_tracking_error_m_mean']:.6f} m")
-            print(f"Max tracking error:   {summary['max_tracking_error_m_mean']:.6f} m")
-            print(f"Final tracking error: {summary['final_tracking_error_m_mean']:.6f} m")
-            print(f"Episode reward:       {summary['episode_reward_mean']:.6f}")
-            print(f"Success rate:         {summary['success_rate_mean']:.3f}")
-            print(f"Mean action norm:     {summary['mean_action_norm_mean']:.6f}")
-            print(f"Action sat. rate:     {summary['action_saturation_rate_mean']:.3f}")
-            print(f"Current best error:   {best:.6f} m")
+            print(f"Mean tracking error:         {summary['mean_tracking_error_m_mean']:.6f} m")
+            print(f"RMS tracking error:          {summary['rms_tracking_error_m_mean']:.6f} m")
+            print(f"Max tracking error:          {summary['max_tracking_error_m_mean']:.6f} m")
+            print(f"Final tracking error:        {summary['final_tracking_error_m_mean']:.6f} m")
+            print(f"Episode reward:              {summary['episode_reward_mean']:.6f}")
+            print(f"Success rate:                {summary['success_rate_mean']:.3f}")
+            print(f"Mean action norm:            {summary['mean_action_norm_mean']:.6f}")
+            print(f"Action sat. rate:            {summary['action_saturation_rate_mean']:.3f}")
+            print(f"Mean test step time compute: {summary['mean_step_compute_time_ms_mean']:.6f} ms")
+            print(f"Mean test step time full:    {summary['mean_step_full_loop_time_ms_mean']:.6f} ms")
+            print(f"Current best error:          {best:.6f} m")
 
             if summary["mean_tracking_error_m_mean"] < best:
                 best = summary["mean_tracking_error_m_mean"]
@@ -618,11 +809,16 @@ def train(config):
 
             print("=======================\n")
         episode += 1
+
+    training_time_s = time.perf_counter() - train_wall_t0
     agent.save(ckpt_dir / "final.pt")
     final_eval = evaluate(agent, config, path, "final")
-    write_summary(path, config, final_eval, best)
+    with (Path(path) / "training_time.json").open("w", encoding="utf-8") as f:
+        json.dump({"training_time_s": training_time_s}, f, indent=2)
+    write_summary(path, config, final_eval, best, training_time_s=training_time_s)
     plot_training(path)
     step_log.close()
+    print(f"Total training wall time: {training_time_s:.3f} s")
     print(f"Run saved to {path}")
     return path
 
@@ -635,7 +831,7 @@ def eval_checkpoint(config):
     if config.checkpoint:
         agent.load(config.checkpoint)
     summary = evaluate(agent, config, path, "checkpoint", episodes=config.eval_episodes)
-    write_summary(path, config, summary, summary["mean_tracking_error_m_mean"])
+    write_summary(path, config, summary, summary["mean_tracking_error_m_mean"], training_time_s=0.0)
     print(json.dumps(summary, indent=2, sort_keys=True))
     print(f"Evaluation saved to {path}")
     return path
@@ -650,14 +846,19 @@ def compare(config):
         cfg = ExperimentConfig(**asdict(config))
         cfg.variant, cfg.control_mode = variant, mode
         agent = make_agent(cfg)
-        summary = evaluate(agent, cfg, path / label, "untrained", episodes=cfg.eval_episodes)
+        if cfg.checkpoint:
+            agent.load(cfg.checkpoint)
+        summary = evaluate(agent, cfg, path / label, "compare", episodes=cfg.eval_episodes)
         row = {
             "label": label,
             "mean_tracking_error_m": summary["mean_tracking_error_m_mean"],
+            "rmse_tracking_error_m": summary["rmse_tracking_error_m_mean"],
             "rms_tracking_error_m": summary["rms_tracking_error_m_mean"],
             "max_tracking_error_m": summary["max_tracking_error_m_mean"],
             "final_tracking_error_m": summary["final_tracking_error_m_mean"],
             "success_rate": summary["success_rate_mean"],
+            "mean_step_compute_time_ms": summary["mean_step_compute_time_ms_mean"],
+            "mean_step_full_loop_time_ms": summary["mean_step_full_loop_time_ms_mean"],
         }
         rows.append(row)
         append_csv(path / "comparison.csv", row, fields=list(row.keys()))
@@ -668,19 +869,26 @@ def compare(config):
 
 def write_report(path, rows):
     lines = [
-        "# SAC Tracking Debug Report", "",
-        "## Current Pipeline", "",
-        "- `TwoLink` in `Core_SAC.py` owns dynamics, inverse kinematics, forward kinematics, and pygame drawing.",
-        "- Target generation follows the PDF's task-space sinusoid in the available 2D plane.",
-        "- `sac_agent.py` contains the generic SAC actor, critics, replay buffer, updates, and checkpoint serialization.", "",
-        "## PDF Direct-Torque Evaluation", "",
+        "# SAC Tracking Debug Report",
+        "",
+        "## Current Pipeline",
+        "",
+        "- `TwoLink` owns dynamics, inverse kinematics, forward kinematics, and pygame drawing.",
+        "- Target generation supports ellipse, circle, and PDF task-space trajectories.",
+        "- `sac_agent.py` contains the generic SAC actor, critics, replay buffer, updates, and checkpoint serialization.",
+        "",
+        "## Comparison Snapshot",
+        "",
         f"- Mean tracking error: `{rows[0]['mean_tracking_error_m']:.6f} m`",
-        f"- RMS tracking error: `{rows[0]['rms_tracking_error_m']:.6f} m`",
+        f"- RMSE tracking error: `{rows[0]['rmse_tracking_error_m']:.6f} m`",
         f"- Max tracking error: `{rows[0]['max_tracking_error_m']:.6f} m`",
-        f"- Success rate: `{rows[0]['success_rate']:.3f}`", "",
-        "## Remaining Work", "",
-        "- Full PDF fidelity still requires replacing the 2-DoF arm with the 3-DoF Phantom Omni model.",
-        "- Full PDF fidelity still requires the GAIL discriminator and expert-demonstration loop.",
+        f"- Success rate: `{rows[0]['success_rate']:.3f}`",
+        f"- Mean step compute time: `{rows[0]['mean_step_compute_time_ms']:.4f} ms`",
+        "",
+        "## Remaining Work",
+        "",
+        "- Add more controller baselines if you want a true algorithm comparison table.",
+        "- Keep train/test mismatch and disturbance settings identical across controllers for fair comparison.",
     ]
     with (Path(path) / "REPORT.md").open("w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -692,31 +900,46 @@ def render(config):
     deterministic = bool(config.checkpoint)
     if config.checkpoint:
         agent.load(config.checkpoint)
+
     pygame.init()
     screen = pygame.display.set_mode((1000, 700))
     pygame.display.set_caption(f"TwoLink SAC tracking - {config.variant}/{config.control_mode}")
     clock = pygame.time.Clock()
     font = pygame.font.Font(None, 22)
-    arm = TwoLink()
+
+    arm = build_arm(config, phase="test")
+    disturbance = build_episode_disturbance(config, phase="test", episode_idx=0)
     t = reset_arm(arm, config)
     ref_traj, ee_traj, total_steps = [], [], 0
     running = True
     last = {"reward": 0.0, "ee_error_m": 0.0}
+    compute_times = []
+    full_loop_times = []
+
     while running:
+        loop_t0 = time.perf_counter()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+
         ref = ref_at(arm, t, config.dt, config)
         state = build_state(arm, ref, config)
         prev_ee = ee_px(arm)
+
+        compute_t0 = time.perf_counter()
         tau, tau_res, tau_pd, action_norm = control(arm, agent, state, ref, total_steps, config, deterministic)
-        arm.step(tau, config.dt)
+        spike = disturbance.value_at(total_steps)
+        arm.step(tau, config.dt, disturbance=spike)
         next_ref = ref_at(arm, t, config.dt, config)
-        _, last = reward_metrics(arm, next_ref, prev_ee, action_norm, tau, tau_res, config)
+        _, last = reward_metrics(arm, next_ref, prev_ee, action_norm, tau, tau_res, spike, config)
+        compute_t1 = time.perf_counter()
+
+        compute_times.append((compute_t1 - compute_t0) * 1000.0)
         ee = ee_px(arm)
         ref_traj.append(next_ref["xd_next"].copy())
         ee_traj.append(ee.copy())
         ref_traj, ee_traj = ref_traj[-1500:], ee_traj[-1500:]
+
         screen.fill((245, 245, 245))
         p0, p1, p2 = arm.fk()
         if np.all(np.isfinite(p0)) and np.all(np.isfinite(p1)) and np.all(np.isfinite(p2)):
@@ -731,18 +954,30 @@ def render(config):
             pygame.draw.lines(screen, (50, 200, 50), False, [p.astype(int) for p in ee_traj], 2)
         pygame.draw.circle(screen, (220, 30, 30), next_ref["xd_next"].astype(int), 5)
         pygame.draw.circle(screen, (50, 200, 50), ee.astype(int), 5)
+
+        mean_compute_ms = float(np.mean(compute_times)) if compute_times else 0.0
         texts = [
             f"steps={total_steps} mode={config.control_mode}",
             f"q=[{arm.q[0]:.2f}, {arm.q[1]:.2f}] dq=[{arm.dq[0]:.2f}, {arm.dq[1]:.2f}]",
             f"err={last['ee_error_m']:.4f} m reward={last['reward']:.2f}",
-            f"tau=[{tau[0]:.2f}, {tau[1]:.2f}]",
+            f"tau=[{tau[0]:.2f}, {tau[1]:.2f}] disturb=[{spike[0]:.2f}, {spike[1]:.2f}]",
+            f"avg step compute time={mean_compute_ms:.4f} ms",
+            f"test m1/m2={config.test_m1_actual:.2f}/{config.test_m2_actual:.2f}",
         ]
         for i, text in enumerate(texts):
             screen.blit(font.render(text, True, (0, 0, 0)), (20, 20 + i * 25))
+
         pygame.display.flip()
         t += config.dt
         total_steps += 1
         clock.tick(60)
+        loop_t1 = time.perf_counter()
+        full_loop_times.append((loop_t1 - loop_t0) * 1000.0)
+
+    if compute_times:
+        print(f"Average render/test step compute time: {np.mean(compute_times):.6f} ms")
+    if full_loop_times:
+        print(f"Average render/test full loop time: {np.mean(full_loop_times):.6f} ms")
     pygame.quit()
     sys.exit()
 
@@ -778,12 +1013,27 @@ def parse_args():
         p.add_argument("--checkpoint", default="")
         p.add_argument("--ellipse-a-px", type=float, default=120.0)
         p.add_argument("--ellipse-b-px", type=float, default=70.0)
-        # p.add_argument("--ellipse-cx-px", type=float, default=400.0)
-        # p.add_argument("--ellipse-cy-px", type=float, default=500.0)
         p.add_argument("--omega", type=float, default=0.6)
         p.add_argument("--radius-px", type=float, default=60.0)
         p.add_argument("--center-offset-px", type=float, default=180.0)
         p.add_argument("--ellipse-center-offset-px", type=float, default=170.0)
+
+        p.add_argument("--m1-nominal", type=float, default=2.0)
+        p.add_argument("--m2-nominal", type=float, default=1.5)
+        p.add_argument("--train-m1-actual", type=float, default=2.0)
+        p.add_argument("--train-m2-actual", type=float, default=1.5)
+        p.add_argument("--test-m1-actual", type=float, default=1.9)
+        p.add_argument("--test-m2-actual", type=float, default=1.5)
+        p.add_argument("--controller-bias-std", type=float, default=0.0)
+
+        p.add_argument("--train-use-disturbance", action="store_true")
+        p.add_argument("--test-use-disturbance", action="store_true")
+        p.add_argument("--disturbance-seed-train", type=int, default=701)
+        p.add_argument("--disturbance-seed-test", type=int, default=1701)
+        p.add_argument("--disturbance-min-step", type=int, default=360)
+        p.add_argument("--disturbance-max-step", type=int, default=1200)
+        p.add_argument("--disturbance-low", type=float, default=-5.0)
+        p.add_argument("--disturbance-high", type=float, default=5.0)
 
     for name in ["train", "train-render", "eval", "render", "compare"]:
         common(sub.add_parser(name))
@@ -811,9 +1061,23 @@ def config_from_args(args):
         center_offset_px=args.center_offset_px,
         ellipse_a_px=args.ellipse_a_px,
         ellipse_b_px=args.ellipse_b_px,
-        # ellipse_cx_px=args.ellipse_cx_px,
-        # ellipse_cy_px=args.ellipse_cy_px,
+        ellipse_center_offset_px=args.ellipse_center_offset_px,
         omega=args.omega,
+        m1_nominal=args.m1_nominal,
+        m2_nominal=args.m2_nominal,
+        train_m1_actual=args.train_m1_actual,
+        train_m2_actual=args.train_m2_actual,
+        test_m1_actual=args.test_m1_actual,
+        test_m2_actual=args.test_m2_actual,
+        controller_bias_std=args.controller_bias_std,
+        train_use_disturbance=args.train_use_disturbance,
+        test_use_disturbance=args.test_use_disturbance,
+        disturbance_seed_train=args.disturbance_seed_train,
+        disturbance_seed_test=args.disturbance_seed_test,
+        disturbance_min_step=args.disturbance_min_step,
+        disturbance_max_step=args.disturbance_max_step,
+        disturbance_low=args.disturbance_low,
+        disturbance_high=args.disturbance_high,
     )
 
 

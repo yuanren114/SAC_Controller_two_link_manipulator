@@ -1,249 +1,282 @@
-# Two-Link Arm SAC Trajectory Tracking
+# Two-Link Arm SAC Tracking — Cheatsheet
 
-Train, evaluate, and visualize a Soft Actor-Critic controller for trajectory tracking on a two-link planar robotic arm.
+## What this setup means
 
-## Overview
+This project uses **direct-torque SAC** on a two-link planar arm.
 
-This project applies SAC to an end-effector trajectory tracking problem. The agent observes the arm state, target state, and tracking error, then outputs direct joint torque commands.
+Your intended experiment setup is:
 
-The current system is a two-link planar arm with:
+* **Train** in a **mis-modeled simulation** where link-1 mass is set to **2.0 kg**.
+* **Test / eval / render** in the **target / real dynamics** where link-1 mass is **1.9 kg**.
+* **Train disturbance is disabled**.
+* **Test disturbance is optional** and can be enabled with a fixed seed for reproducibility.
 
-- direct torque control
-- meter-based tracking state
-- selectable target trajectories
-- training, evaluation, logging, plotting, and pygame visualization
+So this is a **train-test dynamics mismatch / sim-to-real-gap style setup**, not an internal model-based controller mismatch.
 
-Core files:
+---
 
-- `Core_SAC.py`: arm dynamics, trajectory generation, state construction, reward/metrics, training, evaluation, rendering, logging, and CLI commands.
-- `sac_agent.py`: SAC actor, critics, replay buffer, losses, entropy tuning, and checkpoint save/load.
+## Most useful commands
 
-## Features
-
-- Direct torque SAC control.
-- `circle` and `pdf` trajectory modes.
-- Training without real-time rendering for faster iteration.
-- Checkpoint evaluation and best-policy tracking.
-- Pygame visualization for trained or untrained policies.
-- Timestamped logs, CSV metrics, trajectory plots, and training curves.
-
-## Quick Start
-
-Train with the default settings:
-
-```powershell
-python Core_SAC.py train
-```
-
-Train, then render the best checkpoint:
-
-```powershell
-python Core_SAC.py train-render --trajectory-mode circle
-```
-
-## Command Line Usage
-
-### Training
-
-```powershell
-python Core_SAC.py train
-```
-
-Runs training with the default `circle` trajectory. Training saves logs, checkpoints, evaluations, and plots. It does not open pygame visualization.
-
-### Training (custom config)
+### 1) Train only
 
 ```powershell
 python Core_SAC.py train `
-  --trajectory-mode circle `
-  --total-steps 20000 `
+  --trajectory-mode ellipse `
+  --total-steps 45000 `
   --eval-interval 5000 `
+  --eval-episodes 3 `
+  --train-m1-actual 2.0 `
+  --test-m1-actual 1.9
+```
+
+Use this when you want training logs, checkpoints, and periodic evaluation, but no pygame window at the end.
+
+---
+
+### 2) Train, then render the best checkpoint
+
+```powershell
+python Core_SAC.py train-render `
+  --trajectory-mode ellipse `
+  --total-steps 45000 `
+  --eval-interval 5000 `
+  --eval-episodes 3 `
+  --train-m1-actual 2.0 `
+  --test-m1-actual 1.9 `
+  --test-use-disturbance `
+  --disturbance-seed-test 1701
+```
+
+This will:
+
+* train in the **2.0 kg simulation**
+* periodically evaluate in the **1.9 kg test dynamics**
+* save metrics and checkpoints
+* open pygame rendering using the best checkpoint after training finishes
+
+---
+
+### 3) Evaluate an existing checkpoint
+
+```powershell
+python Core_SAC.py eval `
+  --checkpoint logs/<your_run>/checkpoints/best.pt `
+  --trajectory-mode ellipse `
   --eval-episodes 5 `
-  --max-episode-steps 200 `
-  --start-steps 200 `
-  --update-after 200 `
-  --batch-size 64
+  --test-m1-actual 1.9 `
+  --test-use-disturbance `
+  --disturbance-seed-test 1701
 ```
 
-Use this form for faster smoke tests or longer training runs by changing the step counts and batch settings.
+Use this to evaluate a saved checkpoint under the target / real test dynamics.
 
-### Render
+---
+
+### 4) Render an existing checkpoint
 
 ```powershell
-python Core_SAC.py render --checkpoint <path_to_checkpoint>
+python Core_SAC.py render `
+  --checkpoint logs/<your_run>/checkpoints/best.pt `
+  --trajectory-mode ellipse `
+  --test-m1-actual 1.9 `
+  --test-use-disturbance `
+  --disturbance-seed-test 1701
 ```
 
-Opens pygame visualization. When `--checkpoint` is provided, the renderer loads that trained policy.
+Use this for visualization only.
 
-### Train + Render
+---
+
+## Smoke-test commands
+
+### Very short training run
 
 ```powershell
-python Core_SAC.py train-render --trajectory-mode circle
+python Core_SAC.py train `
+  --trajectory-mode ellipse `
+  --total-steps 5000 `
+  --eval-interval 2500 `
+  --eval-episodes 2 `
+  --max-episode-steps 500 `
+  --start-steps 500 `
+  --update-after 500 `
+  --batch-size 64 `
+  --train-m1-actual 2.0 `
+  --test-m1-actual 1.9
 ```
 
-Runs training first, then launches pygame visualization using the trained best checkpoint.
+---
 
-### Evaluate
+### Quick eval smoke test
 
 ```powershell
-python Core_SAC.py eval --checkpoint <path_to_checkpoint> --trajectory-mode circle
+python Core_SAC.py eval `
+  --checkpoint logs/<your_run>/checkpoints/best.pt `
+  --trajectory-mode ellipse `
+  --eval-episodes 2 `
+  --test-m1-actual 1.9
 ```
 
-Runs deterministic evaluation and saves metrics, trajectory CSV files, and plots in a new log directory.
+---
 
-### Help
+## What metrics are automatically saved
 
-```powershell
-python Core_SAC.py train --help
-python Core_SAC.py train-render --help
-python Core_SAC.py eval --help
-python Core_SAC.py render --help
-python Core_SAC.py compare --help
-```
+### Training-side metrics
 
-## Key Arguments
+Saved in:
 
-- `--trajectory-mode`
-  - Selects the target trajectory.
-  - `circle` is the default and preserves the original circular path.
-  - `pdf` uses the PDF-style sinusoidal target projected into the current 2D arm environment.
+* `training_episodes.csv`
+* `training_steps.jsonl`
 
-- `--total-steps`
-  - Total training steps across all episodes.
-  - Increase this for better policy performance.
+Common fields include:
 
-- `--max-episode-steps`
-  - Maximum steps per episode.
-  - Smaller values make experiments iterate faster.
+* `episode_reward`
+* `mean_tracking_error_m`
+* `rmse_tracking_error_m`
+* `mean_step_compute_time_ms`
 
-- `--eval-interval`
-  - How often evaluation runs during training.
-  - Larger values reduce evaluation overhead and make training faster.
+---
 
-- `--eval-episodes`
-  - Number of evaluation rollouts per evaluation point.
-  - Smaller values are faster; larger values give more stable metrics.
+### Evaluation-side metrics
 
-- `--start-steps`
-  - Number of random exploration steps before using the policy for data collection.
+Saved in:
 
-- `--update-after`
-  - Number of collected transitions required before gradient updates begin.
+* `evaluation.csv`
+* `eval/<step_label>/summary.json`
+* `summary.md`
 
-- `--batch-size`
-  - SAC minibatch size for gradient updates.
+The main metrics you care about are:
 
-- `--checkpoint`
-  - Path to a saved model checkpoint.
-  - Used by `render` and `eval` to load a trained policy.
+* **Final RMSE tracking error**
+* **Training time**
+* **Mean test step time (compute only)**
+* **Mean test step time (full eval loop)**
 
-## Training vs Evaluation vs Rendering
+---
 
-- `train`
-  - Runs learning.
-  - Saves logs, checkpoints, evaluations, and plots.
-  - Does not show real-time pygame visualization.
+## Where to look after a run
 
-- `eval`
-  - Loads a checkpoint if provided.
-  - Runs deterministic rollouts.
-  - Saves evaluation metrics and trajectory plots.
-
-- `render`
-  - Opens pygame visualization.
-  - Uses a trained policy when `--checkpoint` is provided.
-
-- `train-render`
-  - Runs training first.
-  - Then visualizes the best checkpoint from that training run.
-
-## Trajectory Modes
-
-- `circle`
-  - Default mode.
-  - Preserves the original circular path geometry and angular speed.
-  - Internally converts the original pixel-space circle to meters for consistency with the current state and reward pipeline.
-
-- `pdf`
-  - Uses the PDF-style sinusoidal target trajectory in the current 2D environment:
-
-```text
-x_d = 0.1 sin(t) + 0.12
-y_d = 0.1 cos(t) + 0.12
-```
-
-Both modes provide target position and target velocity in meters to the same state, reward, training, evaluation, and rendering code.
-
-## Control And State
-
-The arm dynamics use:
-
-```text
-M(q) qdd + C(q, dq) + G(q) + damping = tau
-```
-
-The active control path is direct torque:
-
-```text
-tau = clip(actor_action, -action_limit, action_limit)
-```
-
-The actor output is not a target position, delta action, or residual added to a PD controller.
-
-The current state structure is:
-
-```text
-[q, dq, x, dx, x_d, dx_d, e, de]
-```
-
-where:
-
-- `q`, `dq` are joint angle and joint velocity.
-- `x`, `dx` are end-effector position and velocity in meters.
-- `x_d`, `dx_d` are target position and target velocity in meters.
-- `e`, `de` are position and velocity tracking errors.
-
-## Outputs
-
-Each run creates a timestamped directory under `logs/`:
+Each run creates:
 
 ```text
 logs/<timestamp>_<command>_<variant>_<control_mode>_seed<seed>/
 ```
 
-Common outputs:
+Most useful files:
 
-```text
-logs/<timestamp>/
-  config.json
-  summary.md
-  training_episodes.csv
-  training_steps.jsonl
-  training_curves.png
-  evaluation.csv
-  evaluation_tracking_error.png
-  checkpoints/
-    best.pt
-    final.pt
-  eval/
-    <step_label>/
-      episode_000_trajectory.csv
-      episode_000_trajectory.png
-      summary.json
+* `summary.md`
+
+  * final high-level summary
+  * includes training time, final RMSE, and test step timing
+* `training_time.json`
+
+  * total wall-clock training time
+* `evaluation.csv`
+
+  * evaluation summary across checkpoints
+* `training_episodes.csv`
+
+  * training-episode metrics
+* `checkpoints/best.pt`
+
+  * best evaluation checkpoint
+* `checkpoints/final.pt`
+
+  * last checkpoint
+
+---
+
+## What “step time” means
+
+Two timing metrics are recorded during evaluation and rendering.
+
+### 1) Compute-only step time
+
+This includes only the main control/simulation work:
+
+* action selection
+* disturbance injection
+* dynamics step
+* next-state / reward computation
+
+It **does not include pygame drawing**.
+
+This is the better metric for comparing different controllers fairly.
+
+### 2) Full-loop step time
+
+This includes the whole loop, including:
+
+* control + simulation
+* drawing
+* text rendering
+* display update
+
+This is closer to “actual wall-clock frame time” during visualization.
+
+---
+
+## Important PowerShell note
+
+In **PowerShell**, line continuation uses the backtick:
+
+```powershell
+`
 ```
 
-Where to look:
+Do **not** use `^` there. `^` is for **cmd.exe**, not PowerShell.
 
-- Best checkpoint: `logs/<run>/checkpoints/best.pt`
-- Final checkpoint: `logs/<run>/checkpoints/final.pt`
-- Training curve: `logs/<run>/training_curves.png`
-- Evaluation metrics: `logs/<run>/evaluation.csv`
-- Evaluation tracking plot: `logs/<run>/evaluation_tracking_error.png`
-- Per-episode trajectory plots: `logs/<run>/eval/<step_label>/episode_XXX_trajectory.png`
+So this is correct in PowerShell:
 
-## Notes
+```powershell
+python Core_SAC.py train `
+  --trajectory-mode ellipse `
+  --total-steps 45000
+```
 
-- Use `best.pt` when you want the checkpoint with the lowest evaluation tracking error.
-- Use `final.pt` when you specifically want the last policy from a training run.
-- Use smaller `--max-episode-steps`, `--eval-episodes`, and `--batch-size` values for quick smoke tests.
-- Use larger `--total-steps` for meaningful training runs.
+---
+
+## Key argument meanings
+
+* `--train-m1-actual 2.0`
+
+  * the link-1 mass used in the **training simulation**
+  * in your setup, this is the intentionally wrong simulated mass
+
+* `--test-m1-actual 1.9`
+
+  * the link-1 mass used in **test / eval / render**
+  * in your setup, this is the target / real mass
+
+* `--test-use-disturbance`
+
+  * enables fixed-seed spike disturbance during test / eval / render
+
+* `--disturbance-seed-test 1701`
+
+  * fixes the test disturbance so repeated experiments stay comparable
+
+---
+
+## Recommended experiment wording for your report
+
+You can describe the setup like this:
+
+> The policy is trained in a mismatched simulation where the first-link mass is set to 2.0 kg, and evaluated under the target dynamics where the true first-link mass is 1.9 kg. To assess robustness, a fixed-seed spike disturbance is optionally injected during evaluation.
+
+---
+
+## Recommended small cleanup to the code later
+
+The current behavior is correct for your experiment, but these argument names are easy to misunderstand:
+
+* `train_m1_actual`
+* `test_m1_actual`
+
+A clearer naming scheme later would be:
+
+* `train_m1_plant`
+* `test_m1_plant`
+* `m1_nominal`
+
+Behavior does not need to change; this would only improve readability.
